@@ -225,8 +225,17 @@ def save_decision(candidate_id, key):
 
 with sheet_tab:
     analyzed = [c for c in store.clips(pid, include_excluded=False) if c['candidate_count']]
+    counts = store.job_counts(pid)
+    pending = counts.get('queued', 0) + counts.get('running', 0)
+    if pending:
+        note, refresh = st.columns([5, 1], vertical_alignment='center')
+        note.info(f"{len(analyzed)} clip(s) ready · {counts.get('running', 0)} analyzing · "
+                  f"{counts.get('queued', 0)} queued. Each clip appears here as soon as its own "
+                  'analysis finishes; you do not need to wait for the whole queue.')
+        refresh.button('Refresh', key='sheet-refresh', width='stretch')
     if not analyzed:
-        st.info('No analyzed clips yet. Queue analysis from the Queue tab.')
+        if not pending:
+            st.info('No analyzed clips yet. Queue analysis from the Queue tab.')
     else:
         top = st.columns([3, 2, 1])
         clip = top[0].selectbox('Clip', analyzed,

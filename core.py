@@ -78,7 +78,11 @@ def sample_times(duration, count):
 def frame(path, seconds, stream_index=0, preview=True):
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError('Invalid timestamp.')
-    args = ['ffmpeg', '-v', 'error', '-i', str(path), '-ss', f'{seconds:.6f}',
+    # Input seeking (-ss before -i) jumps to the nearest earlier keyframe and decodes
+    # forward, instead of decoding the clip from the start. When re-encoding, FFmpeg
+    # discards frames before the target, so the frame matches output seeking
+    # (verified by test_core) at a fraction of the cost on long clips.
+    args = ['ffmpeg', '-v', 'error', '-ss', f'{seconds:.6f}', '-i', str(path),
             '-map', f'0:{stream_index}', '-frames:v', '1']
     if preview:
         args += ['-vf', 'scale=960:-2']
