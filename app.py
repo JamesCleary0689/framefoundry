@@ -246,16 +246,35 @@ def autopick_all(top_n, reject_rest):
     st.session_state['sheet-message'] = f'Auto-picked top {top_n} in {touched} clip(s).'
 
 
-def next_clip(order, progress):
+def step_clip(order, offset):
+    """Move to the previous/next clip in list order (no wrap-around)."""
     current = st.session_state.get('sheet-clip')
-    after = order[order.index(current) + 1:] + order[:order.index(current)] \
-        if current in order else order
-    target = next((c for c in after if progress.get(c, {}).get('Keep', 0) +
-                   progress.get(c, {}).get('Reject', 0) == 0), None)
+    i = order.index(current) if current in order else 0
+    st.session_state['sheet-clip'] = order[max(0, min(len(order) - 1, i + offset))]
+
+
+def next_to_review(order, progress):
+    """Jump forward to the next clip that still has frames awaiting a decision."""
+    current = st.session_state.get('sheet-clip')
+    after = order[order.index(current) + 1:] if current in order else order
+    target = next((c for c in after if progress.get(c, {}).get('Review', 0)), None)
     if target:
         st.session_state['sheet-clip'] = target
     else:
-        st.session_state['sheet-message'] = 'Every analyzed clip has at least one decision.'
+        st.session_state['sheet-message'] = 'No later clip has frames left to review.'
+
+
+def clip_nav(order, progress, where):
+    i = order.index(st.session_state['sheet-clip'])
+    nav = st.columns(3)
+    nav[0].button('‹ Back', key=f'back-{where}', on_click=step_clip, args=(order, -1),
+                  disabled=i == 0, width='stretch')
+    nav[1].button('Next ›', key=f'next-{where}', on_click=step_clip, args=(order, 1),
+                  disabled=i == len(order) - 1, width='stretch')
+    nav[2].button('To review ›', key=f'review-{where}', on_click=next_to_review,
+                  args=(order, progress), width='stretch',
+                  help='Skip ahead to the next clip that still has frames marked Review')
+    st.caption(f'Clip {i + 1} of {len(order)}')
 
 
 with sheet_tab:
@@ -295,13 +314,14 @@ with sheet_tab:
 
         if st.session_state.get('sheet-clip') not in by_id:
             st.session_state['sheet-clip'] = order[0]
-        top = st.columns([4, 1, 2, 2, 1], vertical_alignment='bottom')
-        top[0].selectbox('Clip', order, key='sheet-clip', format_func=clip_label)
-        top[1].button('Next ›', help='Jump to the next clip with no decisions',
-                      on_click=next_clip, args=(order, progress), width='stretch')
-        show = top[2].pills('Show', ['All'] + list(DECISIONS), default='All', key='sheet-filter')
-        sort = top[3].pills('Order', ['Score', 'Time'], default='Score', key='sheet-order')
-        per_row = top[4].number_input('Per row', 2, 8, 4)
+        pick, nav_area = st.columns([3, 2], vertical_alignment='bottom')
+        pick.selectbox('Clip', order, key='sheet-clip', format_func=clip_label)
+        with nav_area:
+            clip_nav(order, progress, 'top')
+        top = st.columns([2, 2, 1], vertical_alignment='bottom')
+        show = top[0].pills('Show', ['All'] + list(DECISIONS), default='All', key='sheet-filter')
+        sort = top[1].pills('Order', ['Score', 'Time'], default='Score', key='sheet-order')
+        per_row = top[2].number_input('Per row', 2, 8, 4)
         clip = by_id[st.session_state['sheet-clip']]
 
         top_n = st.session_state.get('auto-top', 5)
@@ -356,6 +376,8 @@ with sheet_tab:
                                          on_change=save_decision, args=(k['id'], key))
                     if st.button('Details', key=f"focus-{k['id']}"):
                         st.session_state['focus'] = k['id']
+        st.divider()
+        clip_nav(order, progress, 'bottom')
         focus = next((k for k in scored if k['id'] == st.session_state.get('focus')), None)
         if focus:
             st.divider()

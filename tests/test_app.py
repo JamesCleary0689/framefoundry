@@ -109,3 +109,34 @@ class AppSmokeTest(unittest.TestCase):
 
         [b for b in at.button if b.label == '↺ Undo auto-picks'][0].click().run()
         self.assertEqual(self.store.kept(self.pid), [])
+
+    def test_back_next_and_next_to_review(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+
+        def position():
+            return [c.value for c in at.caption if c.value.startswith('Clip ')][0]
+
+        order = at.selectbox(key='sheet-clip').options
+        self.assertEqual(len(order), 3)
+        self.assertEqual(position(), 'Clip 1 of 3')
+        self.assertTrue(at.button(key='back-top').disabled)
+        # Keeping a frame then pressing Next moves forward, never back to the start.
+        [b for b in at.button if b.label == '✓ Keep #1 only'][0].click().run()
+        at.button(key='next-top').click().run()
+        self.assertEqual(position(), 'Clip 2 of 3')
+        [b for b in at.button if b.label == '✓ Keep #1 only'][0].click().run()
+        at.button(key='next-bottom').click().run()
+        self.assertEqual(position(), 'Clip 3 of 3')
+        self.assertTrue(at.button(key='next-top').disabled)
+        at.button(key='back-bottom').click().run()
+        self.assertEqual(position(), 'Clip 2 of 3')
+        self.assertFalse(at.exception, at.exception)
+
+        # Next to review skips a clip with nothing left in Review.
+        clip2 = [c for c in self.store.clips(self.pid) if c['candidate_count']][1]
+        self.store.bulk_decide([k['id'] for k in self.store.candidates(clip2['id'])], 'Reject',
+                               decided_by='human')
+        at.button(key='back-top').click().run()
+        self.assertEqual(position(), 'Clip 1 of 3')
+        at.button(key='review-top').click().run()
+        self.assertEqual(position(), 'Clip 3 of 3')
