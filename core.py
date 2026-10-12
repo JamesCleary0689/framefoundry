@@ -1,7 +1,6 @@
 """Local, non-destructive video inventory and frame extraction foundation."""
 import csv
 import hashlib
-import io
 import json
 import math
 import re
@@ -12,10 +11,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+import color
+
 EXTENSIONS = {'.mov', '.mp4', '.mxf', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
-TAGS = ['Market', 'Setup', 'Screens', 'Projectors', 'Lasers', 'BounceHouse',
-        'PumpkinPatch', 'Animatronics', 'CostumedCharacters', 'Performance',
-        'Portrait', 'Aerial', 'Ambiance', 'Other']
 
 
 def run(args, timeout=120):
@@ -30,6 +28,13 @@ def dependencies():
     return [x for x in ('ffmpeg', 'ffprobe') if not shutil.which(x)]
 
 
+def is_hidden(relative):
+    """Hidden files and folders, including macOS AppleDouble '._name' companions that
+    exFAT/FAT drives get for every file (they keep the video extension but are not video)
+    and system folders such as .Trashes, .Spotlight-V100 and .fseventsd."""
+    return any(part.startswith('.') for part in Path(relative).parts)
+
+
 def inventory(root):
     root = Path(root).expanduser().resolve(strict=True)
     if not root.is_dir():
@@ -38,7 +43,7 @@ def inventory(root):
     for path in sorted(root.rglob('*')):
         if path.is_symlink() or not path.is_file() or path.suffix.lower() not in EXTENSIONS:
             continue
-        if '.framefoundry' in path.relative_to(root).parts:
+        if is_hidden(path.relative_to(root)):
             continue
         stat = path.stat()
         signature = f'{path}|{stat.st_size}|{stat.st_mtime_ns}'
@@ -69,7 +74,10 @@ def probe(path):
             'stream_index': s['index'], 'codec': s.get('codec_name'),
             'fps': s.get('avg_frame_rate'), 'color_transfer': s.get('color_transfer', 'unknown'),
             'color_primaries': s.get('color_primaries', 'unknown'),
-            'color_space': s.get('color_space', 'unknown')}
+            'color_space': s.get('color_space', 'unknown'),
+            'color_range': s.get('color_range', 'unknown'), 'pix_fmt': s.get('pix_fmt'),
+            'tags': {**{f'format.{k}': v for k, v in raw.get('format', {}).get('tags', {}).items()},
+                     **{f'stream.{k}': v for k, v in s.get('tags', {}).items()}}}
 
 
 def sample_times(duration, count):
@@ -78,19 +86,88 @@ def sample_times(duration, count):
     return [duration * (i + .5) / count for i in range(count)]
 
 
-def frame(path, seconds, stream_index=0, preview=True):
+YUV_MATRICES = {'bt709': 'bt709', 'bt2020nc': 'bt2020', 'bt2020c': 'bt2020',
+                'smpte170m': 'bt601', 'bt470bg': 'bt601', 'fcc': 'fcc', 'smpte240m': 'smpte240m'}
+
+
+def decode_settings(metadata):
+    """YUV->RGB matrix and signal range used to decode. Untagged HD+ footage is decoded
+    as BT.709 (FFmpeg would otherwise assume BT.601 and shift colors)."""
+    metadata = metadata or {}
+    matrix = YUV_MATRICES.get(metadata.get('color_space')) or (
+        'bt709' if metadata.get('height', 1080) >= 720 else 'bt601')
+    full = metadata.get('color_range') == 'pc' or str(metadata.get('pix_fmt')).startswith('yuvj')
+    return matrix, 'pc' if full else 'tv'
+
+
+def decode_command(path, seconds, stream_index=0, preview=True, metadata=None,
+                   input_seek=True):
+    # Input seeking (-ss before -i) jumps to the nearest earlier keyframe and decodes
+    # forward, instead of decoding the clip from the start. When re-encoding, FFmpeg
+    # discards frames before the target, so the frame matches output seeking
+    # (verified by test_core) at a fraction of the cost on long clips.
+    matrix, signal_range = decode_settings(metadata)
+    size = '960:-2' if preview else 'iw:ih'
+    vf = (f'scale={size}:in_color_matrix={matrix}:in_range={signal_range}:out_range=pc:'
+          'flags=accurate_rnd+full_chroma_int,format=rgb48be')
+    seek = ['-ss', f'{seconds:.6f}']
+    return (['ffmpeg', '-v', 'error'] + (seek if input_seek else []) + ['-i', str(path)] +
+            ([] if input_seek else seek) +
+            ['-map', f'0:{stream_index}', '-frames:v', '1', '-vf', vf,
+             '-f', 'image2pipe', '-vcodec', 'ppm', '-'])
+
+
+def parse_ppm16(data):
+    """Decode a binary 16-bit PPM (P6, maxval 65535) to float32 RGB in 0..1."""
+    parts = data.split(maxsplit=4)
+    if len(parts) < 5 or parts[0] != b'P6':
+        raise ValueError('No frame decoded at this timestamp.')
+    width, height, maxval = int(parts[1]), int(parts[2]), int(parts[3])
+    if maxval != 65535:
+        raise ValueError(f'Unexpected PPM maxval {maxval}.')
+    pixels = data[len(data) - width * height * 6:]
+    return (np.frombuffer(pixels, dtype='>u2').reshape(height, width, 3)
+            .astype(np.float32) / 65535)
+
+
+def frame_interval(metadata):
+    """Nominal seconds per frame from the average frame rate (1/24 if unknown)."""
+    try:
+        num, den = (float(x) for x in str((metadata or {}).get('fps') or '24/1').split('/'))
+        return den / num if num > 0 and den > 0 else 1 / 24
+    except ValueError:
+        return 1 / 24
+
+
+def last_decodable(seconds, metadata):
+    """Clamp a time so it does not fall after the start of the clip's last frame, where
+    a seek returns nothing (container duration includes the last frame's length)."""
+    duration = (metadata or {}).get('duration')
+    if not duration:
+        return seconds
+    return max(0.0, min(seconds, duration - 1.5 * frame_interval(metadata)))
+
+
+def decode_rgb(path, seconds, stream_index=0, preview=True, metadata=None):
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError('Invalid timestamp.')
-    args = ['ffmpeg', '-v', 'error', '-i', str(path), '-ss', f'{seconds:.6f}',
-            '-map', f'0:{stream_index}', '-frames:v', '1']
-    if preview:
-        args += ['-vf', 'scale=960:-2']
-    data = run(args + ['-f', 'image2pipe', '-vcodec', 'png', '-'], timeout=180)
+    data = run(decode_command(path, seconds, stream_index, preview, metadata), timeout=180)
+    step = frame_interval(metadata)
+    for attempt in range(1, 4):  # near the very end, step back a frame at a time
+        if data or seconds - attempt * step < 0:
+            break
+        data = run(decode_command(path, seconds - attempt * step, stream_index, preview,
+                                  metadata), timeout=180)
     if not data:
         raise ValueError('No frame decoded at this timestamp.')
-    image = Image.open(io.BytesIO(data)).convert('RGB')
-    image.load()
-    return image
+    return parse_ppm16(data)
+
+
+def frame(path, seconds, stream_index=0, preview=True, profile='rec709', metadata=None):
+    """Decode one frame and convert it to Rec.709 using the clip's color profile."""
+    rgb = decode_rgb(path, seconds, stream_index, preview, metadata)
+    out = color.to_rec709(rgb, profile, limited_range=decode_settings(metadata)[1] == 'tv')
+    return Image.fromarray((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8), 'RGB')
 
 
 def metrics(image):
@@ -122,7 +199,7 @@ def analyze(clip, cache, count=12):
     metadata = probe(clip['path'])
     frames = []
     for i, t in enumerate(sample_times(metadata['duration'], count)):
-        img = frame(clip['path'], t, metadata['stream_index'])
+        img = frame(clip['path'], t, metadata['stream_index'], metadata=metadata)
         target = cache / f'{i:03}.png'
         img.save(target)
         frames.append({'id': f"{clip['id']}-{round(t*1000000):012}",
@@ -161,13 +238,18 @@ def export_still(analysis, candidate, review, output, project='Project'):
             f"{safe_label(review.get('rank', 'B'))}")
     target = folder / (stem + '.png')
     # Exclusive creation prevents overwrites, including reruns.
-    img = frame(clip['path'], candidate['seconds'], analysis['metadata']['stream_index'], False)
+    profile = analysis.get('profile', 'rec709')
+    img = frame(clip['path'], candidate['seconds'], analysis['metadata']['stream_index'], False,
+                profile, analysis['metadata'])
     with target.open('xb') as out:
         img.save(out, format='PNG')
     record = {'file': target.name, 'source': clip['path'], 'clip_id': clip['id'],
               'seconds': candidate['seconds'], 'timestamp_kind': 'seconds from clip start',
               'review': review, 'metadata': analysis['metadata'],
-              'dimensions': list(img.size), 'transform': 'FFmpeg default decode; no creative grade'}
+              'dimensions': list(img.size), 'transform': {**color.describe(profile),
+                            'decode': dict(zip(('yuv_matrix', 'signal_range'),
+                                               decode_settings(analysis['metadata']))),
+                            'bit_depth': '16-bit decode, 8-bit PNG output'}}
     atomic_json(target.with_suffix('.json'), record)
     # Rebuild from sidecars to keep the index recoverable.
     records = [json.loads(p.read_text()) for p in sorted(folder.glob('*.json'))]

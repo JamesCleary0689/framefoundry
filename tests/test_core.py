@@ -3,7 +3,9 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from core import analyze, export_still, inventory, run, sample_times, safe_label
+
+from core import (analyze, decode_command, export_still, frame, inventory,
+                  last_decodable, probe, run, sample_times, safe_label)
 
 
 class CoreTests(unittest.TestCase):
@@ -52,6 +54,33 @@ class CoreTests(unittest.TestCase):
             video.write_bytes(b'changed')
             with self.assertRaises(ValueError):
                 analyze(clip, root / 'cache', 4)
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg required')
+    def test_fast_seek_matches_frame_accurate_seek(self):
+        # Long-GOP H.264 so most targets fall between keyframes.
+        with tempfile.TemporaryDirectory() as temp:
+            video = Path(temp) / 'gop.mp4'
+            run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=30',
+                 '-t', '6', '-c:v', 'libx264', '-g', '90', '-pix_fmt', 'yuv420p', str(video)])
+            for seconds in sample_times(6, 7):
+                slow = run(decode_command(video, seconds, preview=False, input_seek=False))
+                fast = run(decode_command(video, seconds, preview=False))
+                self.assertEqual(fast, slow, seconds)
+                self.assertEqual(frame(video, seconds, preview=False).size, (320, 240))
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg required')
+    def test_samples_near_the_end_of_short_clips_decode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            video = Path(temp) / 'short.mp4'
+            run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=24',
+                 '-t', '1', '-c:v', 'mpeg4', str(video)])
+            meta = probe(video)
+            times = [last_decodable(t, meta) for t in sample_times(meta['duration'], 48)]
+            self.assertLess(max(times), meta['duration'])
+            for t in times[-3:]:
+                self.assertEqual(frame(video, t, metadata=meta).size[0], 960)
+            # Even an unclamped time past the last frame falls back to a nearby frame.
+            self.assertEqual(frame(video, meta['duration'] - 0.001, metadata=meta).size[0], 960)
 
 
 if __name__ == '__main__':

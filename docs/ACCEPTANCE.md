@@ -1,26 +1,26 @@
 # Independent review and pressure-test matrix
 
-| ID | Requirement / test | Foundation status |
+| ID | Requirement / test | Status (after milestone 1) |
 |---|---|---|
 | A01 | Originals byte-identical after processing/export | Synthetic integration test |
-| A02 | Paths with spaces; duplicate camera basenames remain distinct | Spaces tested; multi-camera extension needed |
-| A03 | Source changes invalidate cache | Tested |
-| A04 | Corrupt media produces per-clip error without halting batch | Per-clip UI error only; batch pending |
-| A05 | Missing drive, read-only folder, full disk, disconnect mid-export | Missing parent tested; others pending |
-| A06 | Cancel/resume without duplicate records or orphan jobs | Pending |
+| A02 | Paths with spaces; duplicate camera basenames remain distinct | Spaces and duplicate basenames across sources tested (store + export) |
+| A03 | Source changes invalidate cache | Tested; rescans hide stale candidates and block their export |
+| A04 | Corrupt media produces per-clip error without halting batch | Per-clip job failure; batch continues (synthetic corrupt clip tested) |
+| A05 | Missing drive, read-only folder, full disk, disconnect mid-export | Missing parent, offline source keeps decisions, low disk space tested; read-only, disconnect mid-export pending |
+| A06 | Cancel/resume without duplicate records or orphan jobs | Cancel, resume, interruption, crash recovery, poison limit, no duplicates tested |
 | A07 | Timestamp correctness for CFR, VFR, rotated footage, long GOP | Pending; requested seconds recorded only |
-| A08 | HDR/log transforms explicit, repeatable and recorded | Manual gate only; transforms pending |
-| A09 | Noise not mislabeled as focus; theatrical color not auto-rejected | Honest heuristic labels; calibration pending |
-| A10 | Motion measured temporally; creative scores separated from metrics | Manual notes only |
-| A11 | Talking-head exclusions reversible; false positives reviewable | Manual exclusion implemented |
-| A12 | Multiple useful frames per clip, near-duplicate suppression | Multi-frame sampling; dedup pending |
+| A08 | HDR/log transforms explicit, repeatable and recorded | Per-source/clip profiles (V-Log, S-Log3, LogC3, HLG, PQ, custom LUT), metadata detection, versioned transform recorded in provenance; tested on synthetic signals, not camera files |
+| A09 | Noise not mislabeled as focus; theatrical color not auto-rejected | Score ranks sharpness within each clip; near-black tolerated up to 25% and labelled "may be intentional"; calibration pending |
+| A10 | Motion measured temporally; creative scores separated from metrics | Technical score shown separately from human creative rank; temporal motion not measured |
+| A11 | Talking-head exclusions reversible; false positives reviewable | Reversible exclusions with audit trail, skipped by queue; detection pending |
+| A12 | Multiple useful frames per clip, near-duplicate suppression | Multi-frame sampling; top-N suggestions with preview-hash near-duplicate suppression (heuristic) |
 | A13 | Subject detection with confidence/unknown states; human correction | Manual configurable tags only |
 | A14 | Kept stills only; no export overwrite; full-resolution output | Synthetic integration test |
 | A15 | Index links every exported still to original and time | Sidecars/CSV tested; precise PTS pending |
-| A16 | General project names and tags; no client hard-coding | Implemented; seasonal event optional preset |
+| A16 | General project names and tags; no client hard-coding | Per-project tags and export prefix; presets optional |
 | A17 | One-hour 4K clips / large inventory: bounded CPU/RAM/cache | Pending benchmark |
 | A18 | No media/credentials in Git; no network upload by default | Local design and ignores; release audit needed |
-| A19 | UI restart retains decisions; export manifest recovers from crash | Basic JSON persistence; transaction hardening pending |
+| A19 | UI restart retains decisions; export manifest recovers from crash | SQLite transactional decisions/exclusions/jobs survive restart; export manifest crash recovery pending |
 | A20 | Social crops preserve full master and subject composition | Pending |
 
 Before production: test small representative day/night/drone/handheld/log/HDR
