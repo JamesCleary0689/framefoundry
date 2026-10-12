@@ -13,9 +13,6 @@ import numpy as np
 from PIL import Image
 
 EXTENSIONS = {'.mov', '.mp4', '.mxf', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
-TAGS = ['Market', 'Setup', 'Screens', 'Projectors', 'Lasers', 'BounceHouse',
-        'PumpkinPatch', 'Animatronics', 'CostumedCharacters', 'Performance',
-        'Portrait', 'Aerial', 'Ambiance', 'Other']
 
 
 def run(args, timeout=120):
