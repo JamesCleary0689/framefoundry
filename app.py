@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import streamlit as st
 
+import color
 import picker
 import scoring
 from cli import home
@@ -103,11 +104,66 @@ with st.sidebar:
     st.caption('Uniform sparse sampling can miss brief moments. Scene-aware sampling '
                'and exact frame navigation are planned.')
 
+def apply_profile(kind, obj_id, profile):
+    """Set a source/clip color profile, then queue re-analysis of affected clips."""
+    try:
+        (store.set_source_profile if kind == 'source' else store.set_clip_profile)(obj_id, profile)
+        n = store.enqueue_analysis(pid)
+        st.session_state['profile-message'] = ('success', f'Color profile set to '
+                                               f'{color.label(profile)}; re-analyzing {n} clip(s).')
+    except Exception as e:
+        st.session_state['profile-message'] = ('error', str(e))
+
+
+def on_profile_select(kind, obj_id, key):
+    choice = st.session_state[key]
+    if choice != 'lut':
+        apply_profile(kind, obj_id, choice)
+
+
+def browse_lut(key):
+    try:
+        chosen = picker.pick_file('Choose a 3D LUT (.cube) that converts this log profile '
+                                  'to Rec.709')
+        if chosen:
+            st.session_state[key] = chosen
+    except Exception as e:
+        st.session_state['profile-message'] = ('error', str(e))
+
+
+def source_profile_row(src):
+    current = src['color_profile']
+    key = f"src-profile-{src['id']}"
+    st.session_state.setdefault(key, 'lut' if current.startswith('lut:') else current)
+    a, b, c, d = st.columns([2, 3, 4, 1], vertical_alignment='bottom')
+    a.write(f"**{src['label']}**")
+    b.selectbox('Profile', color.CHOICES, key=key, format_func=color.label,
+                label_visibility='collapsed', on_change=on_profile_select,
+                args=('source', src['id'], key))
+    if st.session_state[key] == 'lut':
+        lut_key = f"src-lut-{src['id']}"
+        st.session_state.setdefault(lut_key, current[4:] if current.startswith('lut:') else '')
+        c.text_input('LUT file', key=lut_key, placeholder='/path/to/VLog_to_709.cube',
+                     label_visibility='collapsed')
+        d.button('Browse…', key=f"src-lut-browse-{src['id']}", on_click=browse_lut,
+                 args=(lut_key,), disabled=not picker.available(), width='stretch')
+        c.button('Apply LUT', key=f"src-lut-apply-{src['id']}", on_click=apply_profile,
+                 args=('source', src['id'], 'lut:' + st.session_state[lut_key]),
+                 disabled=not st.session_state[lut_key])
+
+
+def show_profile_message():
+    kind, message = st.session_state.pop('profile-message', (None, None))
+    if kind:
+        getattr(st, kind)(message)
+
+
 sources_tab, clips_tab, queue_tab, sheet_tab, export_tab = st.tabs(
     ['Sources', 'Clips', 'Queue', 'Contact sheet', 'Selections & export'])
 
 # -- sources ------------------------------------------------------------------
 with sources_tab:
+    show_profile_message()
     def add_source():
         try:
             store.add_source(pid, st.session_state.get('source-path', '').strip(),
@@ -142,11 +198,20 @@ with sources_tab:
             sources = store.sources(pid)
         st.dataframe(pd.DataFrame(sources)[['label', 'path', 'status', 'last_scan_at',
                                             'last_error']], hide_index=True)
+        st.markdown('**Color profile per source** · converts log/HDR footage to Rec.709 '
+                    'before previews, scoring and export')
+        for src in sources:
+            source_profile_row(src)
+        st.caption('Auto converts only when the file says it is HLG/PQ or names a log '
+                   'profile in its metadata. Many cameras (including V-Log bodies) do not, '
+                   'so set the profile here for log sources. Conversion is a technical '
+                   'normalization recorded in export provenance, not a creative grade.')
     else:
         st.info('Add one or more source folders (e.g. one per camera or card).')
 
 # -- clips --------------------------------------------------------------------
 with clips_tab:
+    show_profile_message()
     clips = store.clips(pid)
     if not clips:
         st.info('No clips yet. Add and scan a source.')
@@ -159,6 +224,9 @@ with clips_tab:
                  'status': c['status'] if c['source_status'] != 'offline' else 'source offline',
                  'analysis': c['job_state'] or ('done' if c['candidate_count'] else '—'),
                  'candidates': c['candidate_count'],
+                 'color': ('⚠ possibly log · ' if c['color_note'] else '') +
+                          f"{color.label(c['profile'])} ({c['profile_reason']})",
+                 'override': c['color_profile'] if c['color_profile'] in color.CHOICES else 'auto',
                  'codec': (c['probe'] or {}).get('codec'),
                  'size': f"{c['probe']['width']}×{c['probe']['height']}" if c['probe'] else None,
                  'seconds': round(c['probe']['duration'], 2) if c['probe'] else None,
@@ -167,12 +235,20 @@ with clips_tab:
         edited = st.data_editor(
             pd.DataFrame(rows), hide_index=True, key=f'clips-{pid}-{version}',
             column_order=[k for k in rows[0] if k != 'id'],
-            disabled=[k for k in rows[0] if k not in ('exclude', 'reason')],
-            column_config={'exclude': st.column_config.CheckboxColumn(
+            disabled=[k for k in rows[0] if k not in ('exclude', 'reason', 'override')],
+            column_config={
+                'override': st.column_config.SelectboxColumn(
+                    'Color override', options=[c for c in color.CHOICES if c != 'lut'],
+                    help='Per-clip color profile; Auto inherits the source setting or '
+                         'metadata. Custom LUTs are set per source.', required=True),
+                'exclude': st.column_config.CheckboxColumn(
                 'Exclude', help='Reversible. Excluded clips are skipped by analysis and '
                                 'hidden from the contact sheet; footage is never deleted.')})
         changed = 0
         for before, after in zip(rows, edited.to_dict('records')):
+            if after['override'] and after['override'] != before['override']:
+                apply_profile('clip', before['id'], after['override'])
+                changed += 1
             if (before['exclude'], before['reason']) != (bool(after['exclude']),
                                                          after['reason'] or ''):
                 changed += store.set_excluded(before['id'], after['exclude'], after['reason'])
@@ -323,6 +399,23 @@ with sheet_tab:
         sort = top[1].pills('Order', ['Score', 'Time'], default='Score', key='sheet-order')
         per_row = top[2].number_input('Per row', 2, 8, 4)
         clip = by_id[st.session_state['sheet-clip']]
+
+        prof_a, prof_b = st.columns([2, 3], vertical_alignment='center')
+        prof_key = f"sheet-profile-{clip['id']}"
+        st.session_state[prof_key] = (clip['color_profile']
+                                      if clip['color_profile'] in color.CHOICES else 'auto')
+        prof_a.selectbox('Color profile for this clip', [c for c in color.CHOICES if c != 'lut'],
+                         key=prof_key, format_func=color.label,
+                         on_change=on_profile_select, args=('clip', clip['id'], prof_key))
+        prof_b.caption(f"Previews shown as Rec.709 from **{color.label(clip['analyzed_profile'] or 'rec709')}**"
+                       f" · current setting: {color.label(clip['profile'])} "
+                       f"({clip['profile_reason']})")
+        if clip['analyzed_profile'] and clip['analyzed_profile'] != clip['profile']:
+            st.info('Color profile changed: this clip is queued for re-analysis; previews '
+                    'update when it finishes (press Refresh).')
+        if clip['color_note']:
+            st.warning(clip['color_note'])
+        show_profile_message()
 
         top_n = st.session_state.get('auto-top', 5)
         scored = scoring.score_candidates(store.candidates(clip['id']), top_n)

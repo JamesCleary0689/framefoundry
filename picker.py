@@ -68,3 +68,35 @@ def pick_folder(prompt='Choose a folder', start=None, timeout=600):
     if p.returncode:
         raise RuntimeError(p.stderr.strip() or 'Folder dialog failed.')
     return _clean(p.stdout)
+
+
+MAC_FILE_SCRIPT = ['on run argv',
+                   'set chosen to choose file with prompt (item 1 of argv)',
+                   'return POSIX path of chosen',
+                   'end run']
+
+
+def pick_file(prompt='Choose a file', timeout=600):
+    """Show a native file dialog. Returns the chosen path, or None if cancelled."""
+    if sys.platform == 'darwin':
+        args = ['osascript']
+        for line in MAC_FILE_SCRIPT:
+            args += ['-e', line]
+        p = subprocess.run(args + [prompt], capture_output=True, text=True, timeout=timeout)
+        if p.returncode:
+            if '-128' in p.stderr:
+                return None
+            raise RuntimeError(p.stderr.strip() or 'File dialog failed.')
+        return p.stdout.strip() or None
+    if shutil.which('zenity'):
+        args = ['zenity', '--file-selection', '--title', prompt]
+    elif shutil.which('kdialog'):
+        args = ['kdialog', '--getopenfilename', str(Path.home()), '--title', prompt]
+    else:
+        raise RuntimeError('No file dialog is available on this system; type the path instead.')
+    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    if p.returncode == 1:
+        return None
+    if p.returncode:
+        raise RuntimeError(p.stderr.strip() or 'File dialog failed.')
+    return p.stdout.strip() or None

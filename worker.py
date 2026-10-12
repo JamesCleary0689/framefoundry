@@ -17,6 +17,7 @@ from pathlib import Path
 
 from PIL import Image
 
+import color
 import core
 
 MAX_WORKERS = 8
@@ -43,20 +44,25 @@ def ensure_free_space(folder, min_free_bytes):
 
 
 def analyze_clip(store, job, pool, checkpoint):
-    """Probe a clip and decode uniform preview samples into the project cache."""
+    """Probe a clip, resolve its color profile and decode uniform preview samples,
+    converted to Rec.709, into the project cache."""
     clip = store.clip(job['clip_id'])
     if clip['excluded']:
         raise Skipped('Clip was excluded after it was queued.')
     source = {'path': clip['path'], 'size': clip['size'], 'mtime_ns': clip['mtime_ns']}
     core.verify_source(source)
     count = int(job['params']['sample_count'])
-    folder = (Path(pool.cache_root) / str(clip['project_id']) / clip['id'] /
-              clip['fingerprint'] / f'samples-{count}')
-    folder.mkdir(parents=True, exist_ok=True)
-    ensure_free_space(folder, pool.min_free_bytes)
+    Path(pool.cache_root).mkdir(parents=True, exist_ok=True)
+    ensure_free_space(pool.cache_root, pool.min_free_bytes)
     metadata = core.probe(clip['path'])
+    detected, why = color.detect(metadata)
+    store.record_detection(clip['id'], detected, why)
+    profile, _ = color.resolve(clip['color_profile'], clip['source_profile'], detected)
+    folder = (Path(pool.cache_root) / str(clip['project_id']) / clip['id'] /
+              clip['fingerprint'] / color.cache_key(profile) / f'samples-{count}')
+    folder.mkdir(parents=True, exist_ok=True)
     times = core.sample_times(metadata['duration'], count)
-    frames = []
+    frames, images = [], []
     for i, seconds in enumerate(times):
         checkpoint(i / len(times))
         target = folder / f'{i:03}.png'
@@ -68,16 +74,22 @@ def analyze_clip(store, job, pool, checkpoint):
             except OSError:
                 image = None
         if image is None:
-            image = core.frame(clip['path'], seconds, metadata['stream_index'])
+            image = core.frame(clip['path'], seconds, metadata['stream_index'],
+                               profile=profile, metadata=metadata)
             partial = folder / f'{i:03}.partial'
             image.save(partial, format='PNG')
             partial.replace(target)
+        images.append(image)
         frames.append({'seconds': seconds, 'preview': str(target),
                        'metrics': core.metrics(image)})
     core.verify_source(source)
     checkpoint(1.0)
-    store.complete_analysis(clip['id'], clip['fingerprint'], metadata,
-                            f'uniform-{count}', frames)
+    note = None
+    if profile == 'rec709' and not detected and color.looks_flat(images):
+        note = ('Low contrast across all samples: possibly log footage without metadata. '
+                'Set a color profile if so.')
+    store.complete_analysis(clip['id'], clip['fingerprint'], metadata, f'uniform-{count}',
+                            frames, profile, note)
 
 
 def export_frame(store, job, pool, checkpoint):

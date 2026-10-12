@@ -3,6 +3,7 @@
     python cli.py project create "My Shoot" --prefix MyShoot --preset General
     python cli.py source add my-shoot /path/to/CameraA --label "Camera A"
     python cli.py scan my-shoot
+    python cli.py profile my-shoot vlog --source "Camera A"   # log footage
     python cli.py enqueue my-shoot --samples 12
     python cli.py work --workers 2
     python cli.py autopick my-shoot --top 5
@@ -76,6 +77,14 @@ def main(argv=None):
     export.add_argument('--color-checked', action='store_true',
                         help='Record that display color was checked for these frames')
 
+    prof = sub.add_parser('profile', help='Set the input color profile of a source or clip')
+    prof.add_argument('project')
+    prof.add_argument('profile', help='auto, rec709, vlog, slog3-cine, slog3, logc3, hlg, pq '
+                                      'or lut:/path/to/file.cube')
+    target = prof.add_mutually_exclusive_group(required=True)
+    target.add_argument('--source', help='Source label')
+    target.add_argument('--clip', help='Clip path relative to its source')
+
     work = sub.add_parser('work', help='Process queued jobs until the queue is empty')
     work.add_argument('--workers', type=int, default=2)
     work.add_argument('--min-free-mb', type=int, default=DEFAULT_MIN_FREE_BYTES // 1024 ** 2)
@@ -124,6 +133,18 @@ def main(argv=None):
                      '--color-checked.')
         out({'queued': store.enqueue_exports(p['id'], [r['id'] for r in pending], args.output),
              'next': 'run: python cli.py work'})
+    elif args.command == 'profile':
+        p = store.project_by_slug(args.project)
+        if args.source:
+            match = [x['id'] for x in store.sources(p['id']) if x['label'] == args.source]
+            setter = store.set_source_profile
+        else:
+            match = [x['id'] for x in store.clips(p['id']) if x['rel_path'] == args.clip]
+            setter = store.set_clip_profile
+        if len(match) != 1:
+            sys.exit(f'{len(match)} matches; expected exactly one.')
+        out({'profile': setter(match[0], args.profile),
+             'requeued_for_analysis': store.enqueue_analysis(p['id'])})
     elif args.command == 'work':
         pool = WorkerPool(store, cache, args.workers, min_free_bytes=args.min_free_mb * 1024 ** 2)
         try:

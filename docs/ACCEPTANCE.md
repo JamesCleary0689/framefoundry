@@ -9,7 +9,7 @@
 | A05 | Missing drive, read-only folder, full disk, disconnect mid-export | Missing parent, offline source keeps decisions, low disk space tested; read-only, disconnect mid-export pending |
 | A06 | Cancel/resume without duplicate records or orphan jobs | Cancel, resume, interruption, crash recovery, poison limit, no duplicates tested |
 | A07 | Timestamp correctness for CFR, VFR, rotated footage, long GOP | Pending; requested seconds recorded only |
-| A08 | HDR/log transforms explicit, repeatable and recorded | Manual gate only; transforms pending |
+| A08 | HDR/log transforms explicit, repeatable and recorded | Per-source/clip profiles (V-Log, S-Log3, LogC3, HLG, PQ, custom LUT), metadata detection, versioned transform recorded in provenance; tested on synthetic signals, not camera files |
 | A09 | Noise not mislabeled as focus; theatrical color not auto-rejected | Score ranks sharpness within each clip; near-black tolerated up to 25% and labelled "may be intentional"; calibration pending |
 | A10 | Motion measured temporally; creative scores separated from metrics | Technical score shown separately from human creative rank; temporal motion not measured |
 | A11 | Talking-head exclusions reversible; false positives reviewable | Reversible exclusions with audit trail, skipped by queue; detection pending |

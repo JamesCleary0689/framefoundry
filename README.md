@@ -86,8 +86,28 @@ The fingerprint uses path/size/mtime; it is not a content checksum or frame numb
 
 Dark/bright pixel fractions, edge variance and the technical score built from them are
 heuristics, not calibrated quality scores or creative judgments. Colorful lighting is not automatically a white-balance defect.
-FFmpeg's default conversion is not a validated camera-log or HDR workflow.
-Verify display color before exporting; a proper transform pipeline is a next milestone.
+### Log and HDR footage
+
+Frames are decoded at 16 bits with the correct YUV matrix (untagged HD footage is
+treated as BT.709) and converted to Rec.709 **before** previews, scoring and export,
+according to each clip's color profile:
+
+- **Auto** (default) converts only when metadata says so: HLG and PQ transfer tags,
+  or a log profile named in the file's tags. Many cameras, including Panasonic V-Log
+  bodies, do not declare log in metadata, so set the profile per source (Sources tab)
+  or per clip (Clips tab or contact sheet). Low-contrast clips are flagged
+  "possibly log" but never converted automatically.
+- Built in: Panasonic V-Log/V-Gamut, Sony S-Log3 (S-Gamut3.Cine or S-Gamut3), ARRI
+  LogC3 (EI 800)/AWG3, HLG and PQ (BT.2020). Each uses the published curve to
+  scene-linear, a primaries matrix to Rec.709 (D65), a soft highlight roll-off and the
+  Rec.709 OETF.
+- Other log formats (C-Log, N-Log, F-Log, D-Log, …): choose **Custom LUT** and point it
+  at the manufacturer's log-to-Rec.709 `.cube` file.
+
+Changing a profile re-queues analysis; decisions are kept. Exports record the profile,
+method, transform version and decode settings in the provenance JSON. This is a
+technical normalization for review, not a creative grade or a manufacturer's look, and
+exports are 8-bit PNG. Confirm display color before exporting.
 
 ## Tests
 

@@ -12,10 +12,11 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+import color
 import core
 from presets import PRESETS, parse_tags
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ACTIVE_JOB_STATES = ('queued', 'running', 'cancel_requested')
 DECISIONS = ('Review', 'Keep', 'Reject')
 
@@ -123,6 +124,15 @@ MIGRATIONS = {
         "CREATE UNIQUE INDEX jobs_active ON jobs(kind, clip_id, "
         "COALESCE(json_extract(params, '$.candidate_id'), '')) "
         "WHERE state IN ('queued', 'running', 'cancel_requested')"],
+    # Input color profiles (log/HDR -> Rec.709) per source and per clip.
+    4: ["ALTER TABLE sources ADD COLUMN color_profile TEXT NOT NULL DEFAULT 'auto'",
+        "ALTER TABLE clips ADD COLUMN color_profile TEXT NOT NULL DEFAULT 'auto'",
+        'ALTER TABLE clips ADD COLUMN detected_profile TEXT',
+        'ALTER TABLE clips ADD COLUMN detection_note TEXT',
+        'ALTER TABLE clips ADD COLUMN color_note TEXT',
+        'ALTER TABLE clips ADD COLUMN analyzed_profile TEXT',
+        # Earlier analyses decoded without conversion.
+        "UPDATE clips SET analyzed_profile='rec709' WHERE analyzed_fingerprint IS NOT NULL"],
 }
 JOB_TARGET = "COALESCE(json_extract({t}.params, '$.candidate_id'), '')"
 
@@ -304,6 +314,7 @@ class Store:
     def clips(self, project_id, include_excluded=True):
         rows = self.query(
             'SELECT c.*, s.label AS source_label, s.status AS source_status, '
+            's.color_profile AS source_profile, '
             '(SELECT COUNT(*) FROM candidates k WHERE k.clip_id=c.id '
             ' AND k.fingerprint=c.fingerprint) AS candidate_count, '
             "(SELECT j.state FROM jobs j WHERE j.clip_id=c.id AND j.kind='analyze' "
@@ -313,17 +324,40 @@ class Store:
             + ('' if include_excluded else 'AND c.excluded=0 ') +
             'ORDER BY s.label, c.rel_path', (project_id,))
         for row in rows:
-            row['probe'] = json.loads(row['probe']) if row['probe'] else None
-            row['excluded'] = bool(row['excluded'])
+            self._decorate(row)
         return rows
 
-    def clip(self, clip_id):
-        row = self.one('SELECT * FROM clips WHERE id=?', (clip_id,))
-        if not row:
-            raise KeyError(f'No clip {clip_id}')
+    @staticmethod
+    def _decorate(row):
         row['probe'] = json.loads(row['probe']) if row['probe'] else None
         row['excluded'] = bool(row['excluded'])
+        row['profile'], row['profile_reason'] = color.resolve(
+            row['color_profile'], row['source_profile'], row['detected_profile'])
         return row
+
+    def clip(self, clip_id):
+        row = self.one('SELECT c.*, s.color_profile AS source_profile FROM clips c '
+                       'JOIN sources s ON s.id=c.source_id WHERE c.id=?', (clip_id,))
+        if not row:
+            raise KeyError(f'No clip {clip_id}')
+        return self._decorate(row)
+
+    def set_source_profile(self, source_id, profile):
+        profile = color.validate(profile)
+        with self.tx() as db:
+            db.execute('UPDATE sources SET color_profile=? WHERE id=?', (profile, source_id))
+        return profile
+
+    def set_clip_profile(self, clip_id, profile):
+        profile = color.validate(profile)
+        with self.tx() as db:
+            db.execute('UPDATE clips SET color_profile=? WHERE id=?', (profile, clip_id))
+        return profile
+
+    def record_detection(self, clip_id, detected, note):
+        with self.tx() as db:
+            db.execute('UPDATE clips SET detected_profile=?, detection_note=? WHERE id=?',
+                       (detected, note, clip_id))
 
     def set_excluded(self, clip_id, excluded, reason=''):
         """Reversible exclusion; every change is appended to an audit trail."""
@@ -351,7 +385,8 @@ class Store:
         base = hashlib.sha256(f'{clip_id}|{fingerprint}'.encode()).hexdigest()[:16]
         return f'{base}-{round(seconds * 1_000_000):012}'
 
-    def complete_analysis(self, clip_id, fingerprint, probe, sample_set, frames):
+    def complete_analysis(self, clip_id, fingerprint, probe, sample_set, frames,
+                          profile='rec709', color_note=None):
         """Atomically record candidates for one analysis. Upserts keep existing selections."""
         stamp = now()
         with self.tx() as db:
@@ -365,9 +400,10 @@ class Store:
                     (cid, clip_id, fingerprint, sample_set, f['seconds'], f['preview'],
                      json.dumps(f['metrics']), stamp))
             # Only mark analyzed if the clip was not rescanned as changed meanwhile.
-            db.execute('UPDATE clips SET probe=?, error=NULL, analyzed_fingerprint=? '
-                       'WHERE id=? AND fingerprint=?',
-                       (json.dumps(probe), fingerprint, clip_id, fingerprint))
+            db.execute('UPDATE clips SET probe=?, error=NULL, analyzed_fingerprint=?, '
+                       'analyzed_profile=?, color_note=? WHERE id=? AND fingerprint=?',
+                       (json.dumps(probe), fingerprint, profile, color_note, clip_id,
+                        fingerprint))
 
     def record_clip_error(self, clip_id, error):
         with self.tx() as db:
@@ -500,6 +536,9 @@ class Store:
             raise ValueError('Source changed since this frame was sampled. Re-analyze first.')
         if clip['probe'] is None:
             raise ValueError('Clip has not been analyzed.')
+        if clip['analyzed_profile'] != clip['profile']:
+            raise ValueError('Color profile changed since analysis. Re-analyze this clip '
+                             'before exporting.')
         review = self.selection(candidate_id) or {}
         review = {key: review.get(key) for key in
                   ('decision', 'decided_by', 'rank', 'tag', 'period', 'notes',
@@ -507,7 +546,7 @@ class Store:
         project = self.project(clip['project_id'])
         analysis = {'clip': {'id': clip['fingerprint'], 'path': clip['path'],
                              'size': clip['size'], 'mtime_ns': clip['mtime_ns']},
-                    'metadata': clip['probe']}
+                    'metadata': clip['probe'], 'profile': clip['profile']}
         target = core.export_still(analysis, {'id': candidate_id, 'seconds': k['seconds']},
                                    review, output, project['export_prefix'])
         with self.tx() as db:
@@ -529,7 +568,8 @@ class Store:
         added = 0
         with self.tx() as db:
             for c in clips:
-                if not force and c['analyzed_fingerprint'] == c['fingerprint'] and db.execute(
+                if not force and c['analyzed_fingerprint'] == c['fingerprint'] and \
+                        c['analyzed_profile'] == c['profile'] and db.execute(
                         'SELECT 1 FROM candidates WHERE clip_id=? AND fingerprint=? '
                         'AND sample_set=?', (c['id'], c['fingerprint'], f'uniform-{count}')
                 ).fetchone():
@@ -537,9 +577,11 @@ class Store:
                 last = db.execute("SELECT state, params FROM jobs WHERE kind='analyze' AND "
                                   'clip_id=? ORDER BY id DESC LIMIT 1', (c['id'],)).fetchone()
                 if (not force and last and last['state'] in ('failed', 'cancelled') and
-                        json.loads(last['params']).get('fingerprint') == c['fingerprint']):
+                        json.loads(last['params']).get('fingerprint') == c['fingerprint'] and
+                        json.loads(last['params']).get('profile', c['profile']) == c['profile']):
                     continue
-                params = json.dumps({'sample_count': count, 'fingerprint': c['fingerprint']})
+                params = json.dumps({'sample_count': count, 'fingerprint': c['fingerprint'],
+                                     'profile': c['profile']})
                 cur = db.execute(
                     "INSERT INTO jobs(project_id, kind, clip_id, params, state, created_at) "
                     "VALUES(?, 'analyze', ?, ?, 'queued', ?) ON CONFLICT DO NOTHING",

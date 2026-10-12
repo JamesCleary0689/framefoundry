@@ -1,12 +1,11 @@
 import hashlib
-import io
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
-from core import analyze, export_still, frame, inventory, run, sample_times, safe_label
+from core import (analyze, decode_command, export_still, frame, inventory, run,
+                  sample_times, safe_label)
 
 
 class CoreTests(unittest.TestCase):
@@ -64,11 +63,10 @@ class CoreTests(unittest.TestCase):
             run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=30',
                  '-t', '6', '-c:v', 'libx264', '-g', '90', '-pix_fmt', 'yuv420p', str(video)])
             for seconds in sample_times(6, 7):
-                slow = run(['ffmpeg', '-v', 'error', '-i', str(video), '-ss', f'{seconds:.6f}',
-                            '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'])
-                expected = Image.open(io.BytesIO(slow)).convert('RGB')
-                self.assertEqual(frame(video, seconds, preview=False).tobytes(),
-                                 expected.tobytes(), seconds)
+                slow = run(decode_command(video, seconds, preview=False, input_seek=False))
+                fast = run(decode_command(video, seconds, preview=False))
+                self.assertEqual(fast, slow, seconds)
+                self.assertEqual(frame(video, seconds, preview=False).size, (320, 240))
 
 
 if __name__ == '__main__':
