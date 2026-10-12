@@ -1,0 +1,183 @@
+"""Local, non-destructive video inventory and frame extraction foundation."""
+import csv
+import hashlib
+import io
+import json
+import math
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+EXTENSIONS = {'.mov', '.mp4', '.mxf', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
+TAGS = ['Market', 'Setup', 'Screens', 'Projectors', 'Lasers', 'BounceHouse',
+        'PumpkinPatch', 'Animatronics', 'CostumedCharacters', 'Performance',
+        'Portrait', 'Aerial', 'Ambiance', 'Other']
+
+
+def run(args, timeout=120):
+    p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=timeout, check=False)
+    if p.returncode:
+        raise RuntimeError(p.stderr.decode(errors='replace')[-1800:])
+    return p.stdout
+
+
+def dependencies():
+    return [x for x in ('ffmpeg', 'ffprobe') if not shutil.which(x)]
+
+
+def inventory(root):
+    root = Path(root).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError('Source must be an existing folder.')
+    result = []
+    for path in sorted(root.rglob('*')):
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() not in EXTENSIONS:
+            continue
+        if '.framefoundry' in path.relative_to(root).parts:
+            continue
+        stat = path.stat()
+        signature = f'{path}|{stat.st_size}|{stat.st_mtime_ns}'
+        result.append({'id': hashlib.sha256(signature.encode()).hexdigest()[:16],
+                       'path': str(path), 'name': str(path.relative_to(root)),
+                       'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns})
+    return result
+
+
+def verify_source(clip):
+    s = Path(clip['path']).stat()
+    if s.st_size != clip['size'] or s.st_mtime_ns != clip['mtime_ns']:
+        raise ValueError('Source changed. Rescan before continuing.')
+
+
+def probe(path):
+    raw = json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format',
+                          '-of', 'json', str(path)], timeout=45))
+    streams = [s for s in raw.get('streams', []) if s.get('codec_type') == 'video'
+               and not s.get('disposition', {}).get('attached_pic')]
+    if not streams:
+        raise ValueError('No video stream found.')
+    s = streams[0]
+    duration = float(s.get('duration') or raw.get('format', {}).get('duration') or 0)
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Missing or invalid duration.')
+    return {'duration': duration, 'width': s['width'], 'height': s['height'],
+            'stream_index': s['index'], 'codec': s.get('codec_name'),
+            'fps': s.get('avg_frame_rate'), 'color_transfer': s.get('color_transfer', 'unknown'),
+            'color_primaries': s.get('color_primaries', 'unknown'),
+            'color_space': s.get('color_space', 'unknown')}
+
+
+def sample_times(duration, count):
+    if not math.isfinite(duration) or duration <= 0 or not 1 <= count <= 48:
+        raise ValueError('Invalid duration or sample count (1–48).')
+    return [duration * (i + .5) / count for i in range(count)]
+
+
+def frame(path, seconds, stream_index=0, preview=True):
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError('Invalid timestamp.')
+    args = ['ffmpeg', '-v', 'error', '-i', str(path), '-ss', f'{seconds:.6f}',
+            '-map', f'0:{stream_index}', '-frames:v', '1']
+    if preview:
+        args += ['-vf', 'scale=960:-2']
+    data = run(args + ['-f', 'image2pipe', '-vcodec', 'png', '-'], timeout=180)
+    if not data:
+        raise ValueError('No frame decoded at this timestamp.')
+    image = Image.open(io.BytesIO(data)).convert('RGB')
+    image.load()
+    return image
+
+
+def metrics(image):
+    gray = np.asarray(image.resize((320, 180)).convert('L'), dtype=float)
+    lap = (gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] +
+           gray[1:-1, 2:] - 4 * gray[1:-1, 1:-1])
+    return {'edge_variance': round(float(lap.var()), 2),
+            'dark_fraction': round(float((gray < 8).mean()), 4),
+            'bright_fraction': round(float((gray > 247).mean()), 4)}
+
+
+def atomic_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(data, indent=2))
+    temp.replace(path)
+
+
+def analyze(clip, cache, count=12):
+    verify_source(clip)
+    cache = Path(cache) / clip['id'] / f'samples-{count}'
+    cache.mkdir(parents=True, exist_ok=True)
+    manifest = cache / 'analysis.json'
+    if manifest.exists():
+        old = json.loads(manifest.read_text())
+        if all(Path(f['preview']).exists() for f in old['frames']):
+            return old
+    metadata = probe(clip['path'])
+    frames = []
+    for i, t in enumerate(sample_times(metadata['duration'], count)):
+        img = frame(clip['path'], t, metadata['stream_index'])
+        target = cache / f'{i:03}.png'
+        img.save(target)
+        frames.append({'id': f"{clip['id']}-{round(t*1000000):012}",
+                       'seconds': t, 'preview': str(target), **metrics(img)})
+    result = {'clip': clip, 'metadata': metadata, 'frames': frames,
+              'sampling': 'Uniform sparse samples; not a full clip review.'}
+    atomic_json(manifest, result)
+    return result
+
+
+def safe_label(text):
+    return re.sub(r'[^A-Za-z0-9_-]+', '-', text).strip('-')[:48] or 'Other'
+
+
+def csv_safe(value):
+    text = str(value)
+    return "'" + text if text.startswith(('=', '+', '-', '@', '\t', '\r')) else text
+
+
+def export_still(analysis, candidate, review, output, project='Project'):
+    if review.get('decision') != 'Keep':
+        raise ValueError('Only explicitly kept frames may be exported.')
+    if review.get('color_verified') is not True:
+        raise ValueError('Confirm display color before export.')
+    clip = analysis['clip']
+    verify_source(clip)
+    root = Path(output).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError('Output parent must already exist; check the drive is mounted.')
+    folder = root / (safe_label(project) + '_Still_Selects')
+    folder.mkdir(exist_ok=True)
+    if folder.is_symlink():
+        raise ValueError('Export folder cannot be a symlink.')
+    stem = (f"{safe_label(project)}_{safe_label(review.get('period', 'Unknown'))}_"
+            f"{safe_label(review.get('tag', 'Other'))}_{candidate['id']}_"
+            f"{safe_label(review.get('rank', 'B'))}")
+    target = folder / (stem + '.png')
+    # Exclusive creation prevents overwrites, including reruns.
+    img = frame(clip['path'], candidate['seconds'], analysis['metadata']['stream_index'], False)
+    with target.open('xb') as out:
+        img.save(out, format='PNG')
+    record = {'file': target.name, 'source': clip['path'], 'clip_id': clip['id'],
+              'seconds': candidate['seconds'], 'timestamp_kind': 'seconds from clip start',
+              'review': review, 'metadata': analysis['metadata'],
+              'dimensions': list(img.size), 'transform': 'FFmpeg default decode; no creative grade'}
+    atomic_json(target.with_suffix('.json'), record)
+    # Rebuild from sidecars to keep the index recoverable.
+    records = [json.loads(p.read_text()) for p in sorted(folder.glob('*.json'))]
+    tmp = folder / 'stills_index.csv.tmp'
+    with tmp.open('w', newline='') as out:
+        writer = csv.writer(out)
+        writer.writerow(['file', 'source', 'seconds', 'rank', 'period', 'subject', 'notes'])
+        for row in records:
+            r = row['review']
+            writer.writerow([csv_safe(x) for x in [row['file'], row['source'], row['seconds'],
+                              r.get('rank'), r.get('period'), r.get('tag'), r.get('notes', '')]])
+    tmp.replace(folder / 'stills_index.csv')
+    return target

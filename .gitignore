@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.DS_Store
+.framefoundry/
+*.mov
+*.mp4
+*.dng
+*.jpg
+*.png
+*.sqlite*
