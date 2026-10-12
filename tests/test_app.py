@@ -60,8 +60,8 @@ class AppSmokeTest(unittest.TestCase):
         at = AppTest.from_file(APP, default_timeout=60).run()
         self.assertFalse(at.exception, at.exception)
         clip_picker = [s for s in at.selectbox if s.label == 'Clip'][0]
-        label = f"{first['source_label']} / {first['rel_path']}"
-        self.assertNotIn(label, clip_picker.options)
+        label = f"{first['source_label']} / {first['rel_path']} —"
+        self.assertFalse(any(label in o for o in clip_picker.options), clip_picker.options)
         self.assertEqual(len(clip_picker.options), 2)
 
     def test_browse_fills_source_path_and_adds_source(self):
@@ -82,3 +82,30 @@ class AppSmokeTest(unittest.TestCase):
         labels = [s['label'] for s in self.store.sources(self.pid)]
         self.assertIn('Camera C', labels)
         self.assertEqual(at.text_input(key='source-path').value, '')
+
+    def test_quick_actions_and_export_all(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        keep = [b for b in at.button if b.label.startswith('✓ Keep top ') and 'reject' not in b.label]
+        keep[0].click().run()
+        self.assertFalse(at.exception, at.exception)
+        kept = self.store.kept(self.pid)
+        self.assertGreaterEqual(len(kept), 1)
+        self.assertTrue(all(r['decided_by'] == 'auto' for r in kept))
+        self.assertIn('★ #1', ' '.join(m.value for m in at.markdown))
+
+        [b for b in at.button if b.label == 'Color checked for kept'][0].click().run()
+        self.assertTrue(all(r['color_verified'] for r in self.store.kept(self.pid)))
+
+        out = Path(self._temp.name) / 'exports'
+        out.mkdir()
+        pid = self.pid
+        at.text_input(key=f'output-{pid}').input(str(out)).run()
+        [b for b in at.button if b.label.startswith('Export all ')][0].click().run()
+        self.assertFalse(at.exception, at.exception)
+        pngs = list(out.rglob('*.png'))
+        self.assertEqual(len(pngs), len(kept))
+        sidecar = pngs[0].with_suffix('.json').read_text()
+        self.assertIn('"decided_by": "auto"', sidecar)
+
+        [b for b in at.button if b.label == '↺ Undo auto-picks'][0].click().run()
+        self.assertEqual(self.store.kept(self.pid), [])

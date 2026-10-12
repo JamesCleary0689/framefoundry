@@ -18,12 +18,18 @@ the database and supports cancel, resume/retry, crash recovery and per-clip erro
 a contact-sheet review UI with immediately persisted Keep/Reject/Review decisions,
 human rank/subject/period/notes and a color-verified gate; configurable project
 tags and export prefixes; FFprobe metadata, uniform sparse candidate sampling and
-heuristic technical screening metrics; full-resolution PNG export with provenance
-sidecars and CSV index. Source media stays local and is never modified.
+heuristic technical screening metrics; an explainable per-frame technical score
+(relative sharpness within the clip plus highlight clipping, with reasons shown);
+suggested top-N frames per clip with near-duplicate suppression; quick actions (keep
+suggestions, reject the rest, keep #1, undo automatic picks, mark kept frames
+color-checked) and project-wide auto-pick for clips nobody has started; batch export of
+ready frames; full-resolution PNG export with provenance sidecars and CSV index.
+Automatic decisions are labelled `auto` in the UI and in export provenance and never
+override a person's decision. Source media stays local and is never modified.
 
 Not implemented: autonomous semantic review, reliable talking-head detection,
-scene-aware sampling, temporal motion analysis, fine frame navigation, perceptual
-deduplication, automatic color management, batch export queue, contact-sheet
+scene-aware sampling, temporal motion analysis, fine frame navigation, automatic color
+management, a resumable background export queue, contact-sheet
 exports, social crops, native packaging or automated Claude orchestration.
 DNG image sequences are not ingested. Review decisions saved by the earlier
 JSON-based foundation (`reviews.json`) are not migrated into the database.
@@ -67,6 +73,7 @@ python cli.py scan my-shoot
 python cli.py enqueue my-shoot --samples 12
 python cli.py work --workers 2
 python cli.py status my-shoot
+python cli.py autopick my-shoot --top 5   # optional: keep technical suggestions
 ```
 
 Do not point a first run at entire drives; validate on a small folder.
@@ -76,8 +83,8 @@ sidecar per still, and `stills_index.csv`. Names include project, period, subjec
 source fingerprint, clip-relative microsecond timestamp and creative rank.
 The fingerprint uses path/size/mtime; it is not a content checksum or frame number.
 
-Dark/bright pixel fractions and edge variance are heuristics, not calibrated
-quality scores. Colorful lighting is not automatically a white-balance defect.
+Dark/bright pixel fractions, edge variance and the technical score built from them are
+heuristics, not calibrated quality scores or creative judgments. Colorful lighting is not automatically a white-balance defect.
 FFmpeg's default conversion is not a validated camera-log or HDR workflow.
 Verify display color before exporting; a proper transform pipeline is a next milestone.
 

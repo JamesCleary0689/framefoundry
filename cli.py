@@ -5,6 +5,7 @@
     python cli.py scan my-shoot
     python cli.py enqueue my-shoot --samples 12
     python cli.py work --workers 2
+    python cli.py autopick my-shoot --top 5
     python cli.py status my-shoot
 
 Data lives in $FRAMEFOUNDRY_HOME (default ~/.framefoundry). Nothing is uploaded.
@@ -15,6 +16,7 @@ import os
 import sys
 from pathlib import Path
 
+import scoring
 from presets import PRESETS, parse_tags
 from store import Store
 from worker import DEFAULT_MIN_FREE_BYTES, WorkerPool
@@ -62,6 +64,11 @@ def main(argv=None):
     exclude.add_argument('--reason', default='')
     exclude.add_argument('--undo', action='store_true')
 
+    autopick = sub.add_parser('autopick', help='Keep the top-N technical suggestions per clip')
+    autopick.add_argument('project')
+    autopick.add_argument('--top', type=int, default=5)
+    autopick.add_argument('--reject-rest', action='store_true')
+
     work = sub.add_parser('work', help='Process queued jobs until the queue is empty')
     work.add_argument('--workers', type=int, default=2)
     work.add_argument('--min-free-mb', type=int, default=DEFAULT_MIN_FREE_BYTES // 1024 ** 2)
@@ -95,6 +102,11 @@ def main(argv=None):
         out({'cancelled': store.cancel_jobs(store.project_by_slug(args.project)['id'])})
     elif args.command == 'resume':
         out({'resumed': store.resume_jobs(store.project_by_slug(args.project)['id'])})
+    elif args.command == 'autopick':
+        p = store.project_by_slug(args.project)
+        names = {c['id']: f"{c['source_label']}/{c['rel_path']}" for c in store.clips(p['id'])}
+        changed = scoring.autopick(store, p['id'], args.top, args.reject_rest)
+        out({'frames_changed_per_clip': {names[k]: v for k, v in changed.items()}})
     elif args.command == 'work':
         pool = WorkerPool(store, cache, args.workers, min_free_bytes=args.min_free_mb * 1024 ** 2)
         try:

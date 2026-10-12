@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 import picker
+import scoring
 from cli import home
 from core import dependencies
 from presets import PRESETS, parse_tags
@@ -223,6 +224,40 @@ def save_decision(candidate_id, key):
         store.save_selection(candidate_id, decision=value)
 
 
+def quick(action, scored, clip_id):
+    """Per-clip quick actions. Automatic picks never override a person's decision."""
+    picks = [k['id'] for k in scoring.suggestions(scored)]
+    rest = [k['id'] for k in scored if k['id'] not in picks]
+    if action == 'keep':
+        n = store.bulk_decide(picks, 'Keep')
+    elif action == 'keep-reject':
+        n = store.bulk_decide(picks, 'Keep') + store.bulk_decide(rest, 'Reject')
+    elif action == 'keep-one':
+        n = store.bulk_decide(picks[:1], 'Keep')
+    elif action == 'undo':
+        n = store.undo_auto(clip_id=clip_id)
+    elif action == 'verify':
+        n = store.mark_color_verified([k['id'] for k in scored if k['decision'] == 'Keep'])
+    st.session_state['sheet-message'] = f'{n} frame(s) updated.'
+
+
+def autopick_all(top_n, reject_rest):
+    touched = sum(bool(n) for n in scoring.autopick(store, pid, top_n, reject_rest).values())
+    st.session_state['sheet-message'] = f'Auto-picked top {top_n} in {touched} clip(s).'
+
+
+def next_clip(order, progress):
+    current = st.session_state.get('sheet-clip')
+    after = order[order.index(current) + 1:] + order[:order.index(current)] \
+        if current in order else order
+    target = next((c for c in after if progress.get(c, {}).get('Keep', 0) +
+                   progress.get(c, {}).get('Reject', 0) == 0), None)
+    if target:
+        st.session_state['sheet-clip'] = target
+    else:
+        st.session_state['sheet-message'] = 'Every analyzed clip has at least one decision.'
+
+
 with sheet_tab:
     analyzed = [c for c in store.clips(pid, include_excluded=False) if c['candidate_count']]
     counts = store.job_counts(pid)
@@ -237,43 +272,100 @@ with sheet_tab:
         if not pending:
             st.info('No analyzed clips yet. Queue analysis from the Queue tab.')
     else:
-        top = st.columns([3, 2, 1])
-        clip = top[0].selectbox('Clip', analyzed,
-                                format_func=lambda c: f"{c['source_label']} / {c['rel_path']}")
-        show = top[1].pills('Show', ['All'] + list(DECISIONS), default='All', key='sheet-filter')
-        per_row = top[2].number_input('Per row', 2, 8, 4)
-        candidates = store.candidates(clip['id'])
-        visible = [k for k in candidates if show in (None, 'All') or k['decision'] == show]
-        tally = {d: sum(k['decision'] == d for k in candidates) for d in DECISIONS}
-        st.caption(f"{len(candidates)} candidates · " +
+        progress = store.clip_progress(pid)
+        by_id = {c['id']: c for c in analyzed}
+        order = list(by_id)
+
+        def clip_label(cid):
+            c, p = by_id[cid], progress.get(cid, {})
+            mark = '●' if p.get('Keep', 0) + p.get('Reject', 0) else '○'
+            return (f"{mark} {c['source_label']} / {c['rel_path']} — {p.get('Keep', 0)} kept · "
+                    f"{p.get('Review', 0)} to review")
+
+        with st.expander('Automate all clips'):
+            a, b, c = st.columns([1, 2, 2], vertical_alignment='bottom')
+            top_all = a.number_input('Top N', 1, 10, 5, key='auto-top')
+            reject_rest = b.checkbox('Also reject the rest', key='auto-reject')
+            c.button(f'Auto-pick top {top_all} in untouched clips', type='primary',
+                     on_click=autopick_all, args=(top_all, reject_rest), width='stretch')
+            st.caption('Applies only to clips where nobody has made a decision yet. Picks are '
+                       'labelled automatic, can be undone per clip, and never change your own '
+                       'decisions. The score is a technical heuristic (relative sharpness and '
+                       'clipping), not a judgment of composition or subject.')
+
+        if st.session_state.get('sheet-clip') not in by_id:
+            st.session_state['sheet-clip'] = order[0]
+        top = st.columns([4, 1, 2, 2, 1], vertical_alignment='bottom')
+        top[0].selectbox('Clip', order, key='sheet-clip', format_func=clip_label)
+        top[1].button('Next ›', help='Jump to the next clip with no decisions',
+                      on_click=next_clip, args=(order, progress), width='stretch')
+        show = top[2].pills('Show', ['All'] + list(DECISIONS), default='All', key='sheet-filter')
+        sort = top[3].pills('Order', ['Score', 'Time'], default='Score', key='sheet-order')
+        per_row = top[4].number_input('Per row', 2, 8, 4)
+        clip = by_id[st.session_state['sheet-clip']]
+
+        top_n = st.session_state.get('auto-top', 5)
+        scored = scoring.score_candidates(store.candidates(clip['id']), top_n)
+        picks = scoring.suggestions(scored)
+        with st.container(border=True):
+            st.markdown(f'**Suggested top {len(picks)}** · technical screening — verify visually'
+                        + ('' if len(picks) == top_n else
+                           f' · only {len(picks)} distinct frame(s) after removing near-duplicates'))
+            q = st.columns(5)
+            q[0].button(f'✓ Keep top {len(picks)}', on_click=quick,
+                        args=('keep', scored, clip['id']), width='stretch', type='primary')
+            q[1].button('✓ Keep top, ✕ reject rest', on_click=quick,
+                        args=('keep-reject', scored, clip['id']), width='stretch')
+            q[2].button('✓ Keep #1 only', on_click=quick,
+                        args=('keep-one', scored, clip['id']), width='stretch')
+            q[3].button('↺ Undo auto-picks', on_click=quick,
+                        args=('undo', scored, clip['id']), width='stretch')
+            q[4].button('Color checked for kept', on_click=quick,
+                        args=('verify', scored, clip['id']), width='stretch',
+                        help='Record that you have checked display color for every kept frame '
+                             'in this clip (required before export).')
+        message = st.session_state.pop('sheet-message', None)
+        if message:
+            st.toast(message)
+
+        visible = [k for k in scored if show in (None, 'All') or k['decision'] == show]
+        if sort != 'Time':
+            visible.sort(key=lambda k: (k['suggested_rank'] or 99, -k['score'], k['seconds']))
+        tally = {d: sum(k['decision'] == d for k in scored) for d in DECISIONS}
+        st.caption(f"{len(scored)} candidates · " +
                    ' · '.join(f'{n} {d}' for d, n in tally.items()) +
-                   ' · decisions save immediately')
-        st.warning('Metrics are uncalibrated screening signals. Edge detail can be noise; '
-                   'darkness can be intentional. White balance, composition, motion and '
+                   ' · decisions save immediately · "auto" marks automatic picks')
+        st.warning('Scores and metrics are uncalibrated screening signals. Edge detail can be '
+                   'noise; darkness can be intentional. White balance, composition, motion and '
                    'subject relevance require visual review. Log/HDR footage needs a verified '
                    'viewing transform before delivery.')
         for start in range(0, len(visible), per_row):
             for col, k in zip(st.columns(per_row), visible[start:start + per_row]):
                 with col.container(border=True):
                     st.image(k['preview'], width='stretch')
-                    m = k['metrics']
-                    st.caption(f"{k['seconds']:.3f}s · edge {m['edge_variance']} · "
-                               f"dark {m['dark_fraction']:.2f} · bright {m['bright_fraction']:.2f}")
+                    badge = f"★ #{k['suggested_rank']} · " if k['suggested_rank'] else ''
+                    auto = ' · auto' if k['decided_by'] == 'auto' and k['decision'] != 'Review' else ''
+                    st.markdown(f"**{badge}score {k['score']}** · {k['seconds']:.2f}s{auto}")
+                    if k['reasons']:
+                        st.caption(' · '.join(k['reasons']))
                     key = f"decision-{k['id']}"
-                    st.session_state.setdefault(key, k['decision'])
+                    st.session_state[key] = k['decision']  # always reflect the database
                     st.segmented_control('Decision', list(DECISIONS), key=key,
                                          format_func=DECISION_ICONS.get,
                                          label_visibility='collapsed',
                                          on_change=save_decision, args=(k['id'], key))
                     if st.button('Details', key=f"focus-{k['id']}"):
                         st.session_state['focus'] = k['id']
-        focus = next((k for k in candidates if k['id'] == st.session_state.get('focus')), None)
+        focus = next((k for k in scored if k['id'] == st.session_state.get('focus')), None)
         if focus:
             st.divider()
             left, right = st.columns([2, 1])
             left.image(focus['preview'], width='stretch',
                        caption=f"Clip-relative {focus['seconds']:.6f}s (requested seek time; "
                                'not a verified frame number) · preview reduced to 960px')
+            m = focus['metrics']
+            left.caption(f"Technical score {focus['score']} · edge {m['edge_variance']} · "
+                         f"near-black {m['dark_fraction']:.1%} · clipped {m['bright_fraction']:.1%}")
             with right, st.form(f"detail-{focus['id']}"):
                 def choice(label, items, current):
                     return st.selectbox(label, items,
@@ -291,10 +383,23 @@ with sheet_tab:
                     store.save_selection(focus['id'], decision=decision, rank=rank,
                                          period=period, tag=tag, notes=notes,
                                          color_verified=color)
-                    st.session_state[f"decision-{focus['id']}"] = decision
                     st.success('Saved')
 
+
 # -- selections and export ------------------------------------------------------
+def export_all(rows, output):
+    done, skipped, errors = 0, 0, []
+    for row in rows:
+        try:
+            store.export_candidate(row['id'], output)
+            done += 1
+        except FileExistsError:
+            skipped += 1
+        except Exception as e:
+            errors.append(f"{row['rel_path']} @ {row['seconds']:.2f}s: {e}")
+    st.session_state['export-result'] = (done, skipped, errors)
+
+
 with export_tab:
     kept = store.kept(pid)
     output = folder_field('Existing export parent folder', f'output-{pid}',
@@ -306,16 +411,31 @@ with export_tab:
     if not kept:
         st.info('No kept frames yet. Mark frames Keep on the contact sheet.')
     else:
-        table = pd.DataFrame(kept)[['source_label', 'rel_path', 'seconds', 'rank', 'tag',
-                                    'period', 'color_verified', 'exported_file']]
+        ready = [r for r in kept if r['color_verified'] and not r['exported_file']]
+        unverified = sum(not r['color_verified'] for r in kept)
+        a, b = st.columns([2, 3], vertical_alignment='center')
+        a.button(f'Export all {len(ready)} ready frame(s)', type='primary',
+                 disabled=not ready or not output, on_click=export_all, args=(ready, output),
+                 width='stretch')
+        b.caption(f'{len(kept)} kept · {len(ready)} ready to export · {unverified} awaiting '
+                  'color check (use "Color checked for kept" on the contact sheet)')
+        result = st.session_state.pop('export-result', None)
+        if result:
+            done, skipped, errors = result
+            st.success(f'Exported {done} frame(s); {skipped} already existed and were not '
+                       'overwritten.')
+            for e in errors:
+                st.error(e)
+        table = pd.DataFrame(kept)[['source_label', 'rel_path', 'seconds', 'decided_by', 'rank',
+                                    'tag', 'period', 'color_verified', 'exported_file']]
         picked = st.dataframe(table, hide_index=True, on_select='rerun',
                               selection_mode='single-row', key=f'kept-{pid}')
         rows = picked.selection.rows
-        if rows and st.button('Export selected kept frame', type='primary'):
+        if rows and st.button('Export selected kept frame'):
             try:
                 st.success(str(store.export_candidate(kept[rows[0]]['id'], output)))
             except FileExistsError:
                 st.info('This named selection already exists. It was not overwritten.')
             except Exception as e:
                 st.error(str(e))
-        st.caption('Batch export, contact-sheet PDFs and social crops are later milestones.')
+        st.caption('Contact-sheet PDFs and social crops are later milestones.')

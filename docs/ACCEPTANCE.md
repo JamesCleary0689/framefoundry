@@ -10,10 +10,10 @@
 | A06 | Cancel/resume without duplicate records or orphan jobs | Cancel, resume, interruption, crash recovery, poison limit, no duplicates tested |
 | A07 | Timestamp correctness for CFR, VFR, rotated footage, long GOP | Pending; requested seconds recorded only |
 | A08 | HDR/log transforms explicit, repeatable and recorded | Manual gate only; transforms pending |
-| A09 | Noise not mislabeled as focus; theatrical color not auto-rejected | Honest heuristic labels; calibration pending |
-| A10 | Motion measured temporally; creative scores separated from metrics | Manual notes only |
+| A09 | Noise not mislabeled as focus; theatrical color not auto-rejected | Score ranks sharpness within each clip; near-black tolerated up to 25% and labelled "may be intentional"; calibration pending |
+| A10 | Motion measured temporally; creative scores separated from metrics | Technical score shown separately from human creative rank; temporal motion not measured |
 | A11 | Talking-head exclusions reversible; false positives reviewable | Reversible exclusions with audit trail, skipped by queue; detection pending |
-| A12 | Multiple useful frames per clip, near-duplicate suppression | Multi-frame sampling; dedup pending |
+| A12 | Multiple useful frames per clip, near-duplicate suppression | Multi-frame sampling; top-N suggestions with preview-hash near-duplicate suppression (heuristic) |
 | A13 | Subject detection with confidence/unknown states; human correction | Manual configurable tags only |
 | A14 | Kept stills only; no export overwrite; full-resolution output | Synthetic integration test |
 | A15 | Index links every exported still to original and time | Sidecars/CSV tested; precise PTS pending |

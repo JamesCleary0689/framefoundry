@@ -15,10 +15,12 @@ from pathlib import Path
 import core
 from presets import PRESETS, parse_tags
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ACTIVE_JOB_STATES = ('queued', 'running', 'cancel_requested')
 DECISIONS = ('Review', 'Keep', 'Reject')
 
+# Version 1 schema; later versions are reached by applying MIGRATIONS in order, so new
+# and upgraded databases always end up identical.
 SCHEMA = """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE projects(
@@ -112,6 +114,13 @@ CREATE TABLE exports(
 """
 
 
+MIGRATIONS = {
+    # Who made a selection decision: a person, or an automatic suggestion they triggered.
+    2: ["ALTER TABLE selections ADD COLUMN decided_by TEXT NOT NULL DEFAULT 'human' "
+        "CHECK(decided_by IN ('human', 'auto'))"],
+}
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
@@ -133,11 +142,16 @@ class Store:
                 for statement in SCHEMA.split(';'):
                     if statement.strip():
                         db.execute(statement)
-                db.execute("INSERT INTO meta VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+                db.execute("INSERT INTO meta VALUES('schema_version', '1')")
             version = int(db.execute("SELECT value FROM meta WHERE key='schema_version'")
                           .fetchone()[0])
-            if version != SCHEMA_VERSION:
-                raise RuntimeError(f'Unsupported database schema version {version}.')
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(f'Database schema version {version} is newer than this '
+                                   'version of FrameFoundry supports.')
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                for statement in MIGRATIONS[target]:
+                    db.execute(statement)
+                db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
 
     # -- connection helpers -------------------------------------------------
     def connect(self):
@@ -356,7 +370,7 @@ class Store:
         """Candidates for the clip's current source state, in time order, with selections."""
         rows = self.query(
             'SELECT k.*, s.decision, s.rank, s.tag, s.period, s.notes, s.color_verified, '
-            's.updated_at AS reviewed_at FROM candidates k JOIN clips c ON c.id=k.clip_id '
+            's.decided_by, s.updated_at AS reviewed_at FROM candidates k JOIN clips c ON c.id=k.clip_id '
             'LEFT JOIN selections s ON s.candidate_id=k.id '
             'WHERE k.clip_id=? AND k.fingerprint=c.fingerprint ORDER BY k.seconds', (clip_id,))
         for row in rows:
@@ -378,8 +392,10 @@ class Store:
             row['color_verified'] = bool(row['color_verified'])
         return row
 
-    def save_selection(self, candidate_id, **fields):
+    def save_selection(self, candidate_id, decided_by='human', **fields):
         """Merge the given review fields into the candidate's persisted selection."""
+        if decided_by not in ('human', 'auto'):
+            raise ValueError("decided_by must be 'human' or 'auto'.")
         allowed = {'decision', 'rank', 'tag', 'period', 'notes', 'color_verified'}
         unknown = set(fields) - allowed
         if unknown:
@@ -393,19 +409,71 @@ class Store:
         with self.tx() as db:
             db.execute(
                 'INSERT INTO selections(candidate_id, decision, rank, tag, period, notes, '
-                'color_verified, updated_at) VALUES(?,?,?,?,?,?,?,?) '
+                'color_verified, decided_by, updated_at) VALUES(?,?,?,?,?,?,?,?,?) '
                 'ON CONFLICT(candidate_id) DO UPDATE SET decision=excluded.decision, '
                 'rank=excluded.rank, tag=excluded.tag, period=excluded.period, '
                 'notes=excluded.notes, color_verified=excluded.color_verified, '
-                'updated_at=excluded.updated_at',
+                'decided_by=excluded.decided_by, updated_at=excluded.updated_at',
                 (candidate_id, current['decision'], current['rank'], current['tag'],
                  current['period'], current['notes'], int(bool(current['color_verified'])),
-                 now()))
+                 decided_by, now()))
+
+    def bulk_decide(self, candidate_ids, decision, decided_by='auto', overwrite_auto=True):
+        """Set one decision on many candidates in a single transaction. Never overrides a
+        person's decision: only undecided frames (and, if overwrite_auto, earlier automatic
+        decisions) change. Returns the number of frames changed."""
+        if decision not in DECISIONS:
+            raise ValueError(f'Decision must be one of {DECISIONS}.')
+        changed, stamp = 0, now()
+        with self.tx() as db:
+            for cid in candidate_ids:
+                row = db.execute('SELECT decision, decided_by FROM selections '
+                                 'WHERE candidate_id=?', (cid,)).fetchone()
+                if row is None:
+                    db.execute('INSERT INTO selections(candidate_id, decision, decided_by, '
+                               'updated_at) VALUES(?,?,?,?)', (cid, decision, decided_by, stamp))
+                    changed += 1
+                    continue
+                is_open = row['decision'] == 'Review' or (
+                    overwrite_auto and row['decided_by'] == 'auto')
+                if is_open and (row['decision'], row['decided_by']) != (decision, decided_by):
+                    db.execute('UPDATE selections SET decision=?, decided_by=?, updated_at=? '
+                               'WHERE candidate_id=?', (decision, decided_by, stamp, cid))
+                    changed += 1
+        return changed
+
+    def undo_auto(self, clip_id=None, project_id=None):
+        """Return automatic decisions to Review (for one clip or a whole project)."""
+        where, args = ('k.clip_id=?', [clip_id]) if clip_id else ('c.project_id=?', [project_id])
+        with self.tx() as db:
+            return db.execute(
+                "UPDATE selections SET decision='Review', updated_at=? WHERE decided_by='auto' "
+                "AND decision!='Review' AND candidate_id IN (SELECT k.id FROM candidates k "
+                f"JOIN clips c ON c.id=k.clip_id WHERE {where})", [now()] + args).rowcount
+
+    def mark_color_verified(self, candidate_ids):
+        """Record the reviewer's attestation that display color was checked."""
+        with self.tx() as db:
+            return sum(db.execute('UPDATE selections SET color_verified=1, updated_at=? '
+                                  'WHERE candidate_id=? AND color_verified=0',
+                                  (now(), cid)).rowcount for cid in candidate_ids)
+
+    def clip_progress(self, project_id):
+        """Per-clip decision counts for the clip's current candidates."""
+        rows = self.query(
+            "SELECT k.clip_id, COALESCE(s.decision, 'Review') AS decision, COUNT(*) AS n "
+            "FROM candidates k JOIN clips c ON c.id=k.clip_id AND k.fingerprint=c.fingerprint "
+            "LEFT JOIN selections s ON s.candidate_id=k.id WHERE c.project_id=? "
+            "GROUP BY k.clip_id, COALESCE(s.decision, 'Review')", (project_id,))
+        progress = {}
+        for r in rows:
+            progress.setdefault(r['clip_id'], dict.fromkeys(DECISIONS, 0))[r['decision']] = r['n']
+        return progress
 
     def kept(self, project_id):
         return self.query(
             "SELECT k.*, c.rel_path, src.label AS source_label, s.rank, s.tag, s.period, "
-            "s.color_verified, (SELECT file FROM exports e WHERE e.candidate_id=k.id "
+            "s.color_verified, s.decided_by, (SELECT file FROM exports e WHERE e.candidate_id=k.id "
             " ORDER BY e.id DESC LIMIT 1) AS exported_file "
             "FROM selections s JOIN candidates k ON k.id=s.candidate_id "
             "JOIN clips c ON c.id=k.clip_id JOIN sources src ON src.id=c.source_id "
@@ -422,7 +490,8 @@ class Store:
             raise ValueError('Clip has not been analyzed.')
         review = self.selection(candidate_id) or {}
         review = {key: review.get(key) for key in
-                  ('decision', 'rank', 'tag', 'period', 'notes', 'color_verified')}
+                  ('decision', 'decided_by', 'rank', 'tag', 'period', 'notes',
+                   'color_verified')}
         project = self.project(clip['project_id'])
         analysis = {'clip': {'id': clip['fingerprint'], 'path': clip['path'],
                              'size': clip['size'], 'mtime_ns': clip['mtime_ns']},
