@@ -6,6 +6,7 @@ decode); nothing here writes to a source folder.
 """
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from contextlib import closing, contextmanager
@@ -300,7 +301,15 @@ class Store:
                 else:
                     db.execute('UPDATE clips SET last_seen=? WHERE id=?', (stamp, old['id']))
                     counts['unchanged'] += 1
+            counts['removed'] = 0
             for old in known.values():
+                has_candidates = db.execute('SELECT 1 FROM candidates WHERE clip_id=? LIMIT 1',
+                                            (old['id'],)).fetchone()
+                if core.is_hidden(old['rel_path']) and not has_candidates:
+                    # Hidden/AppleDouble entries listed by earlier versions: never real video.
+                    db.execute('DELETE FROM clips WHERE id=?', (old['id'],))
+                    counts['removed'] += 1
+                    continue
                 if old['status'] != 'missing':
                     db.execute("UPDATE clips SET status='missing' WHERE id=?", (old['id'],))
                 counts['missing'] += 1
@@ -717,6 +726,24 @@ class Store:
             'SELECT j.*, c.rel_path, s.label AS source_label FROM jobs j '
             'LEFT JOIN clips c ON c.id=j.clip_id LEFT JOIN sources s ON s.id=c.source_id '
             'WHERE j.project_id=? ORDER BY j.id DESC LIMIT ?', (project_id, limit))
+
+    def failure_summary(self, project_id):
+        """Failed jobs grouped by the first line of their error, largest group first."""
+        rows = self.query(
+            "SELECT j.id, j.kind, j.error, c.rel_path FROM jobs j LEFT JOIN clips c "
+            "ON c.id=j.clip_id WHERE j.project_id=? AND j.state='failed' ORDER BY j.id",
+            (project_id,))
+        groups = {}
+        for r in rows:
+            first_line = (r['error'] or '').strip().splitlines()[:1]
+            # FFmpeg prefixes lines with a varying '[demuxer @ 0x...]' address; drop it.
+            key = (r['kind'], re.sub(r' @ 0x[0-9a-f]+', '', first_line[0] if first_line else ''))
+            g = groups.setdefault(key, {'kind': r['kind'], 'error': (r['error'] or '')[-600:],
+                                        'n': 0, 'first': r['id'], 'last': r['id'],
+                                        'example': r['rel_path']})
+            g['n'] += 1
+            g['last'] = r['id']
+        return sorted(groups.values(), key=lambda g: -g['n'])
 
     def job_counts(self, project_id):
         rows = self.query('SELECT state, COUNT(*) AS n FROM jobs WHERE project_id=? '

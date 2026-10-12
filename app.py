@@ -225,7 +225,9 @@ with sources_tab:
                                    'are kept; rescan once the drive is mounted.')
                     else:
                         st.write(f"{label}: {result['added']} new, {result['changed']} changed, "
-                                 f"{result['missing']} missing, {result['unchanged']} unchanged")
+                                 f"{result['missing']} missing, {result['unchanged']} unchanged"
+                                 + (f", {result['removed']} hidden system file(s) removed"
+                                    if result.get('removed') else ''))
             sources = store.sources(pid)
         st.dataframe(pd.DataFrame(sources)[['label', 'path', 'status', 'last_scan_at',
                                             'last_error']], hide_index=True)
@@ -326,6 +328,14 @@ with queue_tab:
                                              'finished_at']], hide_index=True,
                          column_config={'progress': st.column_config.ProgressColumn(
                              'progress', min_value=0, max_value=1)})
+        failures = store.failure_summary(pid)
+        if failures:
+            with st.expander(f"Why jobs failed ({sum(f['n'] for f in failures)})"):
+                for f in failures:
+                    st.markdown(f"**{f['n']} × {f['kind']}** (jobs {f['first']}–{f['last']}, "
+                                f"e.g. `{f['example']}`)")
+                    st.code(f['error'] or 'No error recorded', language=None)
+                st.caption('Fix the cause, then use "Resume cancelled / retry failed".')
         st.caption('Jobs persist in the project database. Closing the app returns running '
                    'jobs to the queue; cancellation takes effect between decoded frames.')
 

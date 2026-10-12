@@ -73,6 +73,42 @@ class InventoryTests(StoreTestCase):
         self.assertEqual(len({c['fingerprint'] for c in clips}), 2)
         self.assertNotEqual(a, b)
 
+    def test_hidden_and_appledouble_files_ignored_and_purged(self):
+        touch(self.root / 'Card' / 'DCIM' / 'C0001.MP4')
+        touch(self.root / 'Card' / 'DCIM' / '._C0001.MP4', b'\x00\x05\x16\x07')
+        touch(self.root / 'Card' / '.Trashes' / 'old.mov')
+        touch(self.root / 'Card' / '.Spotlight-V100' / 'x.mp4')
+        sid = self.store.add_source(self.pid, self.root / 'Card')
+        self.store.scan_source(sid)
+        self.assertEqual([c['rel_path'] for c in self.store.clips(self.pid)], ['DCIM/C0001.MP4'])
+        # Entries listed by an older version are removed on the next scan.
+        with self.store.tx() as db:
+            db.execute("INSERT INTO clips(id, project_id, source_id, rel_path, path, size, "
+                       "mtime_ns, fingerprint, first_seen, last_seen) VALUES('old', ?, ?, "
+                       "'DCIM/._C0001.MP4', 'x', 4, 1, 'f', 'n', 'n')", (self.pid, sid))
+            db.execute("INSERT INTO jobs(project_id, kind, clip_id, params, state, error, "
+                       "created_at) VALUES(?, 'analyze', 'old', '{}', 'failed', "
+                       "'RuntimeError: [mov,mp4 @ 0x7f8] moov atom not found', 'n')", (self.pid,))
+        self.assertEqual(len(self.store.failure_summary(self.pid)), 1)
+        self.assertEqual(self.store.scan_source(sid)['removed'], 1)
+        self.assertEqual(len(self.store.clips(self.pid)), 1)
+        self.assertEqual(self.store.failure_summary(self.pid), [])
+
+    def test_failure_summary_groups_by_error(self):
+        touch(self.root / 'S' / 'a.mp4')
+        touch(self.root / 'S' / 'b.mp4')
+        touch(self.root / 'S' / 'c.mp4')
+        self.store.scan_source(self.store.add_source(self.pid, self.root / 'S'))
+        self.store.enqueue_analysis(self.pid)
+        errors = ['RuntimeError: [mov @ 0x1] moov atom not found\nmore',
+                  'RuntimeError: [mov @ 0x2] moov atom not found\nother', 'OSError: Low disk']
+        for error in errors:
+            job = self.store.claim_job('w')
+            self.store.finish_job(job['id'], 'failed', error)
+        summary = self.store.failure_summary(self.pid)
+        self.assertEqual([g['n'] for g in summary], [2, 1])
+        self.assertIn('moov atom', summary[0]['error'])
+
     def test_overlapping_and_missing_sources_rejected(self):
         (self.root / 'Top' / 'Sub').mkdir(parents=True)
         self.store.add_source(self.pid, self.root / 'Top')

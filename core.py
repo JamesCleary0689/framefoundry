@@ -28,6 +28,13 @@ def dependencies():
     return [x for x in ('ffmpeg', 'ffprobe') if not shutil.which(x)]
 
 
+def is_hidden(relative):
+    """Hidden files and folders, including macOS AppleDouble '._name' companions that
+    exFAT/FAT drives get for every file (they keep the video extension but are not video)
+    and system folders such as .Trashes, .Spotlight-V100 and .fseventsd."""
+    return any(part.startswith('.') for part in Path(relative).parts)
+
+
 def inventory(root):
     root = Path(root).expanduser().resolve(strict=True)
     if not root.is_dir():
@@ -36,7 +43,7 @@ def inventory(root):
     for path in sorted(root.rglob('*')):
         if path.is_symlink() or not path.is_file() or path.suffix.lower() not in EXTENSIONS:
             continue
-        if '.framefoundry' in path.relative_to(root).parts:
+        if is_hidden(path.relative_to(root)):
             continue
         stat = path.stat()
         signature = f'{path}|{stat.st_size}|{stat.st_mtime_ns}'
