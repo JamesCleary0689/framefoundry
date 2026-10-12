@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import (analyze, decode_command, export_still, frame, inventory, run,
-                  sample_times, safe_label)
+from core import (analyze, decode_command, export_still, frame, inventory,
+                  last_decodable, probe, run, sample_times, safe_label)
 
 
 class CoreTests(unittest.TestCase):
@@ -67,6 +67,20 @@ class CoreTests(unittest.TestCase):
                 fast = run(decode_command(video, seconds, preview=False))
                 self.assertEqual(fast, slow, seconds)
                 self.assertEqual(frame(video, seconds, preview=False).size, (320, 240))
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg required')
+    def test_samples_near_the_end_of_short_clips_decode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            video = Path(temp) / 'short.mp4'
+            run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=24',
+                 '-t', '1', '-c:v', 'mpeg4', str(video)])
+            meta = probe(video)
+            times = [last_decodable(t, meta) for t in sample_times(meta['duration'], 48)]
+            self.assertLess(max(times), meta['duration'])
+            for t in times[-3:]:
+                self.assertEqual(frame(video, t, metadata=meta).size[0], 960)
+            # Even an unclamped time past the last frame falls back to a nearby frame.
+            self.assertEqual(frame(video, meta['duration'] - 0.001, metadata=meta).size[0], 960)
 
 
 if __name__ == '__main__':

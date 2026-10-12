@@ -123,10 +123,34 @@ def parse_ppm16(data):
             .astype(np.float32) / 65535)
 
 
+def frame_interval(metadata):
+    """Nominal seconds per frame from the average frame rate (1/24 if unknown)."""
+    try:
+        num, den = (float(x) for x in str((metadata or {}).get('fps') or '24/1').split('/'))
+        return den / num if num > 0 and den > 0 else 1 / 24
+    except ValueError:
+        return 1 / 24
+
+
+def last_decodable(seconds, metadata):
+    """Clamp a time so it does not fall after the start of the clip's last frame, where
+    a seek returns nothing (container duration includes the last frame's length)."""
+    duration = (metadata or {}).get('duration')
+    if not duration:
+        return seconds
+    return max(0.0, min(seconds, duration - 1.5 * frame_interval(metadata)))
+
+
 def decode_rgb(path, seconds, stream_index=0, preview=True, metadata=None):
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError('Invalid timestamp.')
     data = run(decode_command(path, seconds, stream_index, preview, metadata), timeout=180)
+    step = frame_interval(metadata)
+    for attempt in range(1, 4):  # near the very end, step back a frame at a time
+        if data or seconds - attempt * step < 0:
+            break
+        data = run(decode_command(path, seconds - attempt * step, stream_index, preview,
+                                  metadata), timeout=180)
     if not data:
         raise ValueError('No frame decoded at this timestamp.')
     return parse_ppm16(data)

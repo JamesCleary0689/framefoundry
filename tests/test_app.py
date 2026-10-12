@@ -176,3 +176,35 @@ class AppSmokeTest(unittest.TestCase):
         at.toggle(key=f'show-analyzed-{self.pid}').set_value(True).run()
         editor = [d for d in at.dataframe if 'clip' in d.value.columns][0]
         self.assertEqual(len(editor.value), 4)
+
+    def test_source_navigation_on_contact_sheet_and_tabs(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        sources = at.selectbox(key='sheet-source')
+        self.assertEqual(sources.value, 'all')
+        sid_b = [s['id'] for s in self.store.sources(self.pid) if s['label'] == 'Camera B'][0]
+        sources.set_value(sid_b).run()
+        self.assertFalse(at.exception, at.exception)
+        clips = at.selectbox(key='sheet-clip').options
+        self.assertEqual(len(clips), 1)
+        self.assertIn('Camera B / DCIM/C0001.mp4', clips[0])
+        self.assertTrue(at.button(key='next-top').disabled)  # Next stays within the source
+        # Clips and export tabs offer the same source filter.
+        at.selectbox(key=f'clips-source-{self.pid}').set_value('Camera A').run()
+        at.toggle(key=f'show-analyzed-{self.pid}').set_value(True).run()
+        editor = [d for d in at.dataframe if 'clip' in d.value.columns][0]
+        self.assertEqual(set(editor.value['source']), {'Camera A'})
+
+    def test_decision_click_keeps_clip_selected(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        at.button(key='next-top').click().run()
+        second = at.selectbox(key='sheet-clip').value
+        groups = [g for g in at.button_group if str(g.key).startswith('decision-')]
+        groups[2].set_value('Keep').run()
+        groups = [g for g in at.button_group if str(g.key).startswith('decision-')]
+        groups[3].set_value('Reject').run()
+        self.assertFalse(at.exception, at.exception)
+        self.assertEqual(at.selectbox(key='sheet-clip').value, second)
+        clip = self.store.clip(second)
+        decisions = sorted(k['decision'] for k in self.store.candidates(clip['id']))
+        self.assertEqual(decisions.count('Keep'), 1)
+        self.assertEqual(decisions.count('Reject'), 1)

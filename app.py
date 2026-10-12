@@ -168,6 +168,21 @@ def source_profile_row(src):
                  disabled=not st.session_state[lut_key])
 
 
+def source_filter(key, items, label_of=lambda x: x['source_label']):
+    """'All sources' + per-source dropdown; returns the items in the chosen source."""
+    names = list(dict.fromkeys(label_of(x) for x in items))
+    if len(names) < 2:
+        return items, None
+    if st.session_state.get(key) not in ['All sources'] + names:
+        st.session_state[key] = 'All sources'
+    choice = st.selectbox('Source', ['All sources'] + names, key=key, format_func=lambda n: (
+        f'{n} ({len(items)})' if n == 'All sources' else
+        f'{n} ({sum(label_of(x) == n for x in items)})'))
+    if choice == 'All sources':
+        return items, None
+    return [x for x in items if label_of(x) == choice], choice
+
+
 def show_profile_message():
     kind, message = st.session_state.pop('profile-message', (None, None))
     if kind:
@@ -236,14 +251,15 @@ with clips_tab:
         st.write(f"{len(clips)} clips · {len(analyzed_ids)} analyzed · "
                  f"{sum(c['excluded'] for c in clips)} excluded · "
                  f"{sum(c['status'] == 'missing' for c in clips)} missing · originals untouched")
+        clips, _ = source_filter(f'clips-source-{pid}', clips)
         show_done = st.toggle('Show already-analyzed clips', key=f'show-analyzed-{pid}',
                               help='Analyzed clips are reviewed on the contact sheet. Show them '
                                    'here to exclude one from review or change its color profile.')
         if not show_done:
+            hidden = sum(c['id'] in analyzed_ids for c in clips)
             clips = [c for c in clips if c['id'] not in analyzed_ids]
-            if analyzed_ids:
-                st.caption(f'{len(analyzed_ids)} analyzed clip(s) hidden; they are on the '
-                           'contact sheet.')
+            if hidden:
+                st.caption(f'{hidden} analyzed clip(s) hidden; they are on the contact sheet.')
             if not clips:
                 st.success('Every clip has been analyzed. Review them on the contact sheet.')
     if clips:
@@ -317,6 +333,27 @@ with queue_tab:
 
 # -- contact sheet --------------------------------------------------------------
 DECISION_ICONS = {'Review': '○ Review', 'Keep': '✓ Keep', 'Reject': '✕ Reject'}
+
+
+@st.fragment
+def decision_tile(k):
+    """One contact-sheet frame. A fragment: changing its decision redraws only this
+    tile, so the page does not re-render (or jump) on every click."""
+    st.image(k['preview'], width='stretch')
+    sel = store.selection(k['id']) or {'decision': 'Review', 'decided_by': 'human'}
+    badge = f"★ #{k['suggested_rank']} · " if k['suggested_rank'] else ''
+    auto = ' · auto' if sel['decided_by'] == 'auto' and sel['decision'] != 'Review' else ''
+    st.markdown(f"**{badge}score {k['score']}** · {k['seconds']:.2f}s{auto}")
+    if k['reasons']:
+        st.caption(' · '.join(k['reasons']))
+    key = f"decision-{k['id']}"
+    st.session_state[key] = sel['decision']  # always reflect the database
+    st.segmented_control('Decision', list(DECISIONS), key=key, format_func=DECISION_ICONS.get,
+                         label_visibility='collapsed', on_change=save_decision,
+                         args=(k['id'], key))
+    if st.button('Details', key=f"focus-{k['id']}"):
+        st.session_state['focus'] = k['id']
+        st.rerun()
 
 
 def save_decision(candidate_id, key):
@@ -394,7 +431,9 @@ with sheet_tab:
     else:
         progress = store.clip_progress(pid)
         by_id = {c['id']: c for c in analyzed}
-        order = list(by_id)
+        source_names = {}
+        for c in analyzed:
+            source_names.setdefault(c['source_id'], c['source_label'])
 
         def clip_label(cid):
             c, p = by_id[cid], progress.get(cid, {})
@@ -413,7 +452,34 @@ with sheet_tab:
                        'decisions. The score is a technical heuristic (relative sharpness and '
                        'clipping), not a judgment of composition or subject.')
 
-        if st.session_state.get('sheet-clip') not in by_id:
+        nav_src, nav_status = st.columns([3, 2], vertical_alignment='bottom')
+        src_options = ['all'] + list(source_names)
+        if st.session_state.get('sheet-source') not in src_options:
+            st.session_state['sheet-source'] = 'all'
+        sheet_source = nav_src.selectbox(
+            'Source', src_options, key='sheet-source',
+            format_func=lambda s: f'All sources ({len(analyzed)} clips)' if s == 'all' else
+            f"{source_names[s]} ({sum(c['source_id'] == s for c in analyzed)} clips)")
+        status_filter = nav_status.pills('Clips', ['All', 'To review', 'Reviewed'],
+                                         default='All', key='sheet-clip-status')
+        current = st.session_state.get('sheet-clip')
+
+        def in_view(c):
+            if sheet_source != 'all' and c['source_id'] != sheet_source:
+                return False
+            if c['id'] == current:  # never drop the clip being reviewed from its own list
+                return True
+            left = progress.get(c['id'], {}).get('Review', 0)
+            return (status_filter in (None, 'All') or
+                    (status_filter == 'To review' and left) or
+                    (status_filter == 'Reviewed' and not left))
+
+        order = [c['id'] for c in analyzed if in_view(c)]
+        if not order:
+            st.info(f"No clips in this source are '{status_filter}'; showing all of them.")
+            order = [c['id'] for c in analyzed
+                     if sheet_source == 'all' or c['source_id'] == sheet_source]
+        if current not in order:
             st.session_state['sheet-clip'] = order[0]
         pick, nav_area = st.columns([3, 2], vertical_alignment='bottom')
         pick.selectbox('Clip', order, key='sheet-clip', format_func=clip_label)
@@ -480,20 +546,7 @@ with sheet_tab:
         for start in range(0, len(visible), per_row):
             for col, k in zip(st.columns(per_row), visible[start:start + per_row]):
                 with col.container(border=True):
-                    st.image(k['preview'], width='stretch')
-                    badge = f"★ #{k['suggested_rank']} · " if k['suggested_rank'] else ''
-                    auto = ' · auto' if k['decided_by'] == 'auto' and k['decision'] != 'Review' else ''
-                    st.markdown(f"**{badge}score {k['score']}** · {k['seconds']:.2f}s{auto}")
-                    if k['reasons']:
-                        st.caption(' · '.join(k['reasons']))
-                    key = f"decision-{k['id']}"
-                    st.session_state[key] = k['decision']  # always reflect the database
-                    st.segmented_control('Decision', list(DECISIONS), key=key,
-                                         format_func=DECISION_ICONS.get,
-                                         label_visibility='collapsed',
-                                         on_change=save_decision, args=(k['id'], key))
-                    if st.button('Details', key=f"focus-{k['id']}"):
-                        st.session_state['focus'] = k['id']
+                    decision_tile(k)
         st.divider()
         clip_nav(order, progress, 'bottom')
         focus = next((k for k in scored if k['id'] == st.session_state.get('focus')), None)
@@ -556,6 +609,8 @@ with export_tab:
     if not kept:
         st.info('No kept frames yet. Mark frames Keep on the contact sheet.')
     else:
+        kept, chosen_source = source_filter(f'export-source-{pid}', kept)
+        where = f' from {chosen_source}' if chosen_source else ''
         pending = [r for r in kept if not r['exported_file']]
         unverified = sum(not r['color_verified'] for r in pending)
         if unverified:
@@ -573,7 +628,8 @@ with export_tab:
                               selection_mode='multi-row', key=f'kept-{pid}')
         chosen = [kept[i]['id'] for i in picked.selection.rows]
         a, b = st.columns(2)
-        a.button(f'Export all {len(pending)} not-yet-exported kept frame(s)', type='primary',
+        a.button(f'Export all {len(pending)} not-yet-exported kept frame(s){where}',
+                 type='primary',
                  disabled=not pending or not output, width='stretch',
                  on_click=queue_export, args=([r['id'] for r in pending], output, attest))
         b.button(f'Export {len(chosen)} selected row(s)', disabled=not chosen or not output,

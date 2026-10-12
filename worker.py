@@ -61,7 +61,8 @@ def analyze_clip(store, job, pool, checkpoint):
     folder = (Path(pool.cache_root) / str(clip['project_id']) / clip['id'] /
               clip['fingerprint'] / color.cache_key(profile) / f'samples-{count}')
     folder.mkdir(parents=True, exist_ok=True)
-    times = core.sample_times(metadata['duration'], count)
+    times = [core.last_decodable(t, metadata)
+             for t in core.sample_times(metadata['duration'], count)]
     frames, images = [], []
     for i, seconds in enumerate(times):
         checkpoint(i / len(times))
