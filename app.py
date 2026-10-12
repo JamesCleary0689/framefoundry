@@ -374,8 +374,17 @@ def quick(action, scored, clip_id):
         n = store.bulk_decide(picks[:1], 'Keep')
     elif action == 'undo':
         n = store.undo_auto(clip_id=clip_id)
+    elif action == 'reject-all':
+        # A person's own Keep decisions are left alone; everything else is rejected.
+        current = store.candidates(clip_id)  # fresh: tile clicks don't refresh `scored`
+        n = store.bulk_decide([k['id'] for k in current], 'Reject', decided_by='human')
+        kept = sum(k['decision'] == 'Keep' and k['decided_by'] == 'human' for k in current)
+        st.session_state['sheet-message'] = (f'{n} frame(s) rejected' + (
+            f'; {kept} frame(s) you kept yourself were left as Keep.' if kept else '.'))
+        return
     elif action == 'verify':
-        n = store.mark_color_verified([k['id'] for k in scored if k['decision'] == 'Keep'])
+        n = store.mark_color_verified([k['id'] for k in store.candidates(clip_id)
+                                       if k['decision'] == 'Keep'])
     st.session_state['sheet-message'] = f'{n} frame(s) updated.'
 
 
@@ -515,19 +524,25 @@ with sheet_tab:
             st.markdown(f'**Suggested top {len(picks)}** · technical screening — verify visually'
                         + ('' if len(picks) == top_n else
                            f' · only {len(picks)} distinct frame(s) after removing near-duplicates'))
-            q = st.columns(5)
+            q = st.columns(6)
             q[0].button(f'✓ Keep top {len(picks)}', on_click=quick,
                         args=('keep', scored, clip['id']), width='stretch', type='primary')
-            q[1].button('✓ Keep top, ✕ reject rest', on_click=quick,
-                        args=('keep-reject', scored, clip['id']), width='stretch')
-            q[2].button('✓ Keep #1 only', on_click=quick,
-                        args=('keep-one', scored, clip['id']), width='stretch')
-            q[3].button('↺ Undo auto-picks', on_click=quick,
-                        args=('undo', scored, clip['id']), width='stretch')
-            q[4].button('Color checked for kept', on_click=quick,
+            q[1].button('✓ Top, ✕ rest', on_click=quick,
+                        args=('keep-reject', scored, clip['id']), width='stretch',
+                        help='Keep the suggestions and reject the other frames.')
+            q[2].button('✓ Keep #1', on_click=quick,
+                        args=('keep-one', scored, clip['id']), width='stretch',
+                        help='Keep only the top suggestion.')
+            q[3].button('✕ Reject all', on_click=quick,
+                        args=('reject-all', scored, clip['id']), width='stretch',
+                        help='Reject every frame in this clip except ones you kept yourself.')
+            q[4].button('↺ Undo auto', on_click=quick,
+                        args=('undo', scored, clip['id']), width='stretch',
+                        help='Return automatic picks in this clip to Review.')
+            q[5].button('Color ✓', on_click=quick,
                         args=('verify', scored, clip['id']), width='stretch',
-                        help='Record that you have checked display color for every kept frame '
-                             'in this clip (required before export).')
+                        help='Color checked: record that you have checked display color for '
+                             'every kept frame in this clip (required before export).')
         message = st.session_state.pop('sheet-message', None)
         if message:
             st.toast(message)

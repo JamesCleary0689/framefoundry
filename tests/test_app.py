@@ -99,7 +99,7 @@ class AppSmokeTest(unittest.TestCase):
         self.assertTrue(all(r['decided_by'] == 'auto' for r in kept))
         self.assertIn('★ #1', ' '.join(m.value for m in at.markdown))
 
-        [b for b in at.button if b.label == 'Color checked for kept'][0].click().run()
+        [b for b in at.button if b.label == 'Color ✓'][0].click().run()
         self.assertTrue(all(r['color_verified'] for r in self.store.kept(self.pid)))
 
         out = Path(self._temp.name) / 'exports'
@@ -117,7 +117,7 @@ class AppSmokeTest(unittest.TestCase):
         sidecar = pngs[0].with_suffix('.json').read_text()
         self.assertIn('"decided_by": "auto"', sidecar)
 
-        [b for b in at.button if b.label == '↺ Undo auto-picks'][0].click().run()
+        [b for b in at.button if b.label == '↺ Undo auto'][0].click().run()
         self.assertEqual(self.store.kept(self.pid), [])
 
     def test_back_next_and_next_to_review(self):
@@ -131,10 +131,10 @@ class AppSmokeTest(unittest.TestCase):
         self.assertEqual(position(), 'Clip 1 of 3')
         self.assertTrue(at.button(key='back-top').disabled)
         # Keeping a frame then pressing Next moves forward, never back to the start.
-        [b for b in at.button if b.label == '✓ Keep #1 only'][0].click().run()
+        [b for b in at.button if b.label == '✓ Keep #1'][0].click().run()
         at.button(key='next-top').click().run()
         self.assertEqual(position(), 'Clip 2 of 3')
-        [b for b in at.button if b.label == '✓ Keep #1 only'][0].click().run()
+        [b for b in at.button if b.label == '✓ Keep #1'][0].click().run()
         at.button(key='next-bottom').click().run()
         self.assertEqual(position(), 'Clip 3 of 3')
         self.assertTrue(at.button(key='next-top').disabled)
@@ -153,7 +153,7 @@ class AppSmokeTest(unittest.TestCase):
 
     def test_mass_export_requires_color_confirmation(self):
         at = AppTest.from_file(APP, default_timeout=60).run()
-        [b for b in at.button if b.label == '✓ Keep top, ✕ reject rest'][0].click().run()
+        [b for b in at.button if b.label == '✓ Top, ✕ rest'][0].click().run()
         out = Path(self._temp.name) / 'exports'
         out.mkdir()
         at.text_input(key=f'output-{self.pid}').input(str(out)).run()
@@ -208,3 +208,15 @@ class AppSmokeTest(unittest.TestCase):
         decisions = sorted(k['decision'] for k in self.store.candidates(clip['id']))
         self.assertEqual(decisions.count('Keep'), 1)
         self.assertEqual(decisions.count('Reject'), 1)
+
+    def test_reject_all_keeps_human_keeps(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        clip_id = at.selectbox(key='sheet-clip').value
+        groups = [g for g in at.button_group if str(g.key).startswith('decision-')]
+        groups[0].set_value('Keep').run()  # a person's own Keep
+        [b for b in at.button if b.label == '✕ Reject all'][0].click().run()
+        self.assertFalse(at.exception, at.exception)
+        decisions = [k['decision'] for k in self.store.candidates(clip_id)]
+        self.assertEqual(decisions.count('Keep'), 1)
+        self.assertEqual(decisions.count('Reject'), len(decisions) - 1)
+        self.assertEqual(at.selectbox(key='sheet-clip').value, clip_id)
