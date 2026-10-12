@@ -80,6 +80,18 @@ def analyze_clip(store, job, pool, checkpoint):
                             f'uniform-{count}', frames)
 
 
+def export_frame(store, job, pool, checkpoint):
+    """Export one kept frame at full resolution. Exports are serialised so concurrent
+    workers never race on the shared CSV index; decoding still overlaps with analysis."""
+    checkpoint(0)
+    with pool.export_lock:
+        try:
+            store.export_candidate(job['params']['candidate_id'], job['params']['output'])
+        except FileExistsError:
+            return 'Already exported; existing file was not overwritten.'
+    return None
+
+
 class WorkerPool:
     def __init__(self, store, cache_root, max_workers=2, poll_interval=0.5,
                  stale_after=60.0, max_attempts=3, min_free_bytes=DEFAULT_MIN_FREE_BYTES,
@@ -91,7 +103,8 @@ class WorkerPool:
         self.stale_after = stale_after
         self.max_attempts = max_attempts
         self.min_free_bytes = min_free_bytes
-        self.handlers = handlers or {'analyze': analyze_clip}
+        self.handlers = handlers or {'analyze': analyze_clip, 'export': export_frame}
+        self.export_lock = threading.Lock()
         self.token = f'{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}'
         self.recovered = None
         self._stop = threading.Event()
@@ -161,7 +174,7 @@ class WorkerPool:
         lease = threading.Thread(target=keep_lease, daemon=True)
         lease.start()
         try:
-            self.handlers[job['kind']](self.store, job, self, checkpoint)
+            note = self.handlers[job['kind']](self.store, job, self, checkpoint)
         except Cancelled:
             self.store.finish_job(job['id'], 'cancelled', 'Cancelled by user.')
         except Interrupted:
@@ -170,11 +183,11 @@ class WorkerPool:
             self.store.finish_job(job['id'], 'cancelled', str(reason))
         except Exception as error:  # per-clip failure must not halt the batch
             message = f'{type(error).__name__}: {error}'.strip()
-            if job.get('clip_id'):
+            if job.get('clip_id') and job['kind'] == 'analyze':
                 self.store.record_clip_error(job['clip_id'], message)
             self.store.finish_job(job['id'], 'failed', message)
         else:
-            self.store.finish_job(job['id'], 'done')
+            self.store.finish_job(job['id'], 'done', note if isinstance(note, str) else None)
         finally:
             done.set()
             lease.join()

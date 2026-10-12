@@ -137,6 +137,55 @@ class AnalysisTests(WorkerTestCase):
             self.assertEqual(len(self.store.candidates(clip['id'])), 6)
 
 
+@needs_ffmpeg
+class ExportJobTests(WorkerTestCase):
+    def test_mass_export_in_background_with_per_frame_failures(self):  # A04 A14 A15
+        cam_a, cam_b = make_fixture(self.root / 'media')
+        originals = {p: digest(p) for p in (self.root / 'media').rglob('*') if p.is_file()}
+        self.store.add_source(self.pid, cam_a, 'Camera A')
+        self.store.add_source(self.pid, cam_b, 'Camera B')
+        self.store.scan_project(self.pid)
+        self.store.enqueue_analysis(self.pid)
+        self.pool(max_workers=3).run_until_idle(timeout=120)
+        kept = []
+        for clip in self.store.clips(self.pid):
+            for k in self.store.candidates(clip['id'])[:2]:
+                self.store.save_selection(k['id'], decision='Keep', color_verified=True)
+                kept.append(k['id'])
+        self.store.save_selection(kept[-1], color_verified=False)  # will fail: not checked
+        out = self.root / 'exports'
+        out.mkdir()
+        self.assertEqual(self.store.enqueue_exports(self.pid, kept, out), 6)
+        self.assertEqual(self.store.enqueue_exports(self.pid, kept, out), 0)  # no duplicates
+        with self.assertRaises(FileNotFoundError):
+            self.store.enqueue_exports(self.pid, kept, self.root / 'unmounted')
+        self.pool(max_workers=3).run_until_idle(timeout=120)
+        counts = self.store.job_counts_by_kind(self.pid, 'export')
+        self.assertEqual(counts, {'done': 5, 'failed': 1})
+        folder = out / 'Fixture_Still_Selects'
+        self.assertEqual(len(list(folder.glob('*.png'))), 5)
+        self.assertEqual(len(list(folder.glob('*.json'))), 5)
+        index = (folder / 'stills_index.csv').read_text().splitlines()
+        self.assertEqual(len(index), 6)  # header + 5 rows, written without races
+        failed = [j for j in self.store.jobs(self.pid) if j['kind'] == 'export'
+                  and j['state'] == 'failed'][0]
+        self.assertIn('Confirm display color', failed['error'])
+        # Analysis status of clips is unaffected by export jobs.
+        self.assertEqual(sorted(c['job_state'] for c in self.store.clips(self.pid)),
+                         ['done', 'done', 'done', 'failed'])  # failed = the corrupt clip
+
+        # Fix the cause and retry only the failed frame; re-exporting is never an overwrite.
+        self.store.save_selection(kept[-1], color_verified=True)
+        self.assertEqual(self.store.resume_jobs(self.pid), 2)  # the export + corrupt clip
+        self.assertEqual(self.store.enqueue_exports(self.pid, kept[:1], out), 1)
+        self.pool().run_until_idle(timeout=60)
+        self.assertEqual(len(list(folder.glob('*.png'))), 6)
+        notes = [j['error'] for j in self.store.jobs(self.pid)
+                 if j['kind'] == 'export' and j['state'] == 'done' and j['error']]
+        self.assertEqual(notes, ['Already exported; existing file was not overwritten.'])
+        self.assertEqual(originals, {p: digest(p) for p in originals})
+
+
 class QueueBehaviourTests(WorkerTestCase):
     def test_concurrency_is_bounded(self):
         self.fake_clips(8)

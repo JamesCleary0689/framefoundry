@@ -1,7 +1,9 @@
 """Headless Streamlit smoke test of the review UI against a synthetic fixture project."""
+import gc
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -38,6 +40,10 @@ class AppSmokeTest(unittest.TestCase):
         self.store = store
 
     def tearDown(self):
+        # Stop the app's background workers before deleting their database folder.
+        for obj in gc.get_objects():
+            if isinstance(obj, WorkerPool) and str(obj.cache_root).startswith(self._temp.name):
+                obj.stop(10)
         self.env.stop()
         self._temp.cleanup()
 
@@ -100,8 +106,12 @@ class AppSmokeTest(unittest.TestCase):
         out.mkdir()
         pid = self.pid
         at.text_input(key=f'output-{pid}').input(str(out)).run()
+        self.assertFalse([c for c in at.checkbox if c.key == f'attest-{pid}'])  # all checked
         [b for b in at.button if b.label.startswith('Export all ')][0].click().run()
         self.assertFalse(at.exception, at.exception)
+        deadline = time.time() + 60  # exports run on the app's background workers
+        while len(list(out.rglob('*.png'))) < len(kept) and time.time() < deadline:
+            time.sleep(0.2)
         pngs = list(out.rglob('*.png'))
         self.assertEqual(len(pngs), len(kept))
         sidecar = pngs[0].with_suffix('.json').read_text()
@@ -140,3 +150,18 @@ class AppSmokeTest(unittest.TestCase):
         self.assertEqual(position(), 'Clip 1 of 3')
         at.button(key='review-top').click().run()
         self.assertEqual(position(), 'Clip 3 of 3')
+
+    def test_mass_export_requires_color_confirmation(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        [b for b in at.button if b.label == '✓ Keep top, ✕ reject rest'][0].click().run()
+        out = Path(self._temp.name) / 'exports'
+        out.mkdir()
+        at.text_input(key=f'output-{self.pid}').input(str(out)).run()
+        export_all = lambda: [b for b in at.button if b.label.startswith('Export all ')][0]
+        export_all().click().run()
+        self.assertTrue(any('not been color-checked' in e.value for e in at.error))
+        self.assertEqual(self.store.job_counts_by_kind(self.pid, 'export'), {})
+        at.checkbox(key=f'attest-{self.pid}').check().run()
+        export_all().click().run()
+        self.assertTrue(any('Queued' in s.value for s in at.success))
+        self.assertTrue(all(r['color_verified'] for r in self.store.kept(self.pid)))

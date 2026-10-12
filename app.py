@@ -204,7 +204,7 @@ with queue_tab:
             finished = sum(counts.get(s, 0) for s in ('done', 'failed', 'cancelled'))
             st.progress(finished / total, f'{finished} of {total} jobs finished')
         if jobs:
-            st.dataframe(pd.DataFrame(jobs)[['id', 'source_label', 'rel_path', 'state',
+            st.dataframe(pd.DataFrame(jobs)[['id', 'kind', 'source_label', 'rel_path', 'state',
                                              'progress', 'attempts', 'error', 'started_at',
                                              'finished_at']], hide_index=True,
                          column_config={'progress': st.column_config.ProgressColumn(
@@ -409,17 +409,22 @@ with sheet_tab:
 
 
 # -- selections and export ------------------------------------------------------
-def export_all(rows, output):
-    done, skipped, errors = 0, 0, []
-    for row in rows:
-        try:
-            store.export_candidate(row['id'], output)
-            done += 1
-        except FileExistsError:
-            skipped += 1
-        except Exception as e:
-            errors.append(f"{row['rel_path']} @ {row['seconds']:.2f}s: {e}")
-    st.session_state['export-result'] = (done, skipped, errors)
+def queue_export(candidate_ids, output, attest):
+    """Queue background exports. Ticking the attestation records that display color was
+    checked for exactly these frames; frames without it are refused by export."""
+    try:
+        if attest:
+            store.mark_color_verified(candidate_ids)
+        else:
+            unchecked = [r for r in store.kept(pid)
+                         if r['id'] in set(candidate_ids) and not r['color_verified']]
+            if unchecked:
+                raise ValueError(f'{len(unchecked)} frame(s) have not been color-checked. Tick '
+                                 'the confirmation above once you have checked them.')
+        n = store.enqueue_exports(pid, candidate_ids, output)
+        st.session_state['export-message'] = ('success', f'Queued {n} frame(s) for export.')
+    except Exception as e:
+        st.session_state['export-message'] = ('error', str(e))
 
 
 with export_tab:
@@ -433,31 +438,50 @@ with export_tab:
     if not kept:
         st.info('No kept frames yet. Mark frames Keep on the contact sheet.')
     else:
-        ready = [r for r in kept if r['color_verified'] and not r['exported_file']]
-        unverified = sum(not r['color_verified'] for r in kept)
-        a, b = st.columns([2, 3], vertical_alignment='center')
-        a.button(f'Export all {len(ready)} ready frame(s)', type='primary',
-                 disabled=not ready or not output, on_click=export_all, args=(ready, output),
-                 width='stretch')
-        b.caption(f'{len(kept)} kept · {len(ready)} ready to export · {unverified} awaiting '
-                  'color check (use "Color checked for kept" on the contact sheet)')
-        result = st.session_state.pop('export-result', None)
-        if result:
-            done, skipped, errors = result
-            st.success(f'Exported {done} frame(s); {skipped} already existed and were not '
-                       'overwritten.')
-            for e in errors:
-                st.error(e)
+        pending = [r for r in kept if not r['exported_file']]
+        unverified = sum(not r['color_verified'] for r in pending)
+        if unverified:
+            attest = st.checkbox(
+                f'I have checked display color for the {unverified} frame(s) not yet marked '
+                '(no unresolved log/HDR conversion)', key=f'attest-{pid}',
+                help='Export requires this confirmation. Ticking it records the check on each '
+                     'exported frame.')
+        else:
+            attest = False  # nothing left to attest
+            st.caption('✓ All not-yet-exported kept frames are color-checked.')
         table = pd.DataFrame(kept)[['source_label', 'rel_path', 'seconds', 'decided_by', 'rank',
                                     'tag', 'period', 'color_verified', 'exported_file']]
         picked = st.dataframe(table, hide_index=True, on_select='rerun',
-                              selection_mode='single-row', key=f'kept-{pid}')
-        rows = picked.selection.rows
-        if rows and st.button('Export selected kept frame'):
-            try:
-                st.success(str(store.export_candidate(kept[rows[0]]['id'], output)))
-            except FileExistsError:
-                st.info('This named selection already exists. It was not overwritten.')
-            except Exception as e:
-                st.error(str(e))
-        st.caption('Contact-sheet PDFs and social crops are later milestones.')
+                              selection_mode='multi-row', key=f'kept-{pid}')
+        chosen = [kept[i]['id'] for i in picked.selection.rows]
+        a, b = st.columns(2)
+        a.button(f'Export all {len(pending)} not-yet-exported kept frame(s)', type='primary',
+                 disabled=not pending or not output, width='stretch',
+                 on_click=queue_export, args=([r['id'] for r in pending], output, attest))
+        b.button(f'Export {len(chosen)} selected row(s)', disabled=not chosen or not output,
+                 width='stretch', on_click=queue_export, args=(chosen, output, attest))
+        st.caption(f'{len(kept)} kept · {len(pending)} not yet exported · {unverified} of those '
+                   'not yet color-checked. Select rows (click the left edge; shift-click for a '
+                   'range) to export a subset.')
+        kind, message = st.session_state.pop('export-message', (None, None))
+        if kind:
+            getattr(st, kind)(message)
+
+    @st.fragment(run_every=2)
+    def export_progress():
+        counts = store.job_counts_by_kind(pid, 'export')
+        total = sum(counts.values())
+        if not total:
+            return
+        active = counts.get('queued', 0) + counts.get('running', 0)
+        finished = counts.get('done', 0) + counts.get('failed', 0) + counts.get('cancelled', 0)
+        st.progress(finished / total, f"Export: {counts.get('done', 0)} done · {active} in "
+                                      f"progress · {counts.get('failed', 0)} failed")
+        failed = [j for j in store.jobs(pid, 500) if j['kind'] == 'export' and j['state'] == 'failed']
+        for j in failed[:20]:
+            st.error(f"{j['source_label']} / {j['rel_path']}: {j['error']}")
+        if failed:
+            st.caption('Fix the cause (e.g. remount the drive), then use "Resume cancelled / '
+                       'retry failed" on the Queue tab.')
+
+    export_progress()

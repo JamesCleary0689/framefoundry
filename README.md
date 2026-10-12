@@ -22,14 +22,15 @@ heuristic technical screening metrics; an explainable per-frame technical score
 (relative sharpness within the clip plus highlight clipping, with reasons shown);
 suggested top-N frames per clip with near-duplicate suppression; quick actions (keep
 suggestions, reject the rest, keep #1, undo automatic picks, mark kept frames
-color-checked) and project-wide auto-pick for clips nobody has started; batch export of
-ready frames; full-resolution PNG export with provenance sidecars and CSV index.
+color-checked) and project-wide auto-pick for clips nobody has started; mass export
+of all (or selected) kept frames as background jobs with progress, per-frame errors,
+cancel and retry; full-resolution PNG export with provenance sidecars and CSV index.
 Automatic decisions are labelled `auto` in the UI and in export provenance and never
 override a person's decision. Source media stays local and is never modified.
 
 Not implemented: autonomous semantic review, reliable talking-head detection,
 scene-aware sampling, temporal motion analysis, fine frame navigation, automatic color
-management, a resumable background export queue, contact-sheet
+management, contact-sheet
 exports, social crops, native packaging or automated Claude orchestration.
 DNG image sequences are not ingested. Review decisions saved by the earlier
 JSON-based foundation (`reviews.json`) are not migrated into the database.

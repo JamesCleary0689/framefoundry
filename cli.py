@@ -6,6 +6,7 @@
     python cli.py enqueue my-shoot --samples 12
     python cli.py work --workers 2
     python cli.py autopick my-shoot --top 5
+    python cli.py export my-shoot /Volumes/Backup/Stills --color-checked && python cli.py work
     python cli.py status my-shoot
 
 Data lives in $FRAMEFOUNDRY_HOME (default ~/.framefoundry). Nothing is uploaded.
@@ -69,6 +70,12 @@ def main(argv=None):
     autopick.add_argument('--top', type=int, default=5)
     autopick.add_argument('--reject-rest', action='store_true')
 
+    export = sub.add_parser('export', help='Queue every not-yet-exported kept frame')
+    export.add_argument('project')
+    export.add_argument('output', help='Existing export parent folder')
+    export.add_argument('--color-checked', action='store_true',
+                        help='Record that display color was checked for these frames')
+
     work = sub.add_parser('work', help='Process queued jobs until the queue is empty')
     work.add_argument('--workers', type=int, default=2)
     work.add_argument('--min-free-mb', type=int, default=DEFAULT_MIN_FREE_BYTES // 1024 ** 2)
@@ -107,6 +114,16 @@ def main(argv=None):
         names = {c['id']: f"{c['source_label']}/{c['rel_path']}" for c in store.clips(p['id'])}
         changed = scoring.autopick(store, p['id'], args.top, args.reject_rest)
         out({'frames_changed_per_clip': {names[k]: v for k, v in changed.items()}})
+    elif args.command == 'export':
+        p = store.project_by_slug(args.project)
+        pending = [r for r in store.kept(p['id']) if not r['exported_file']]
+        if args.color_checked:
+            store.mark_color_verified([r['id'] for r in pending])
+        elif any(not r['color_verified'] for r in pending):
+            sys.exit('Some kept frames are not color-checked; check them, then pass '
+                     '--color-checked.')
+        out({'queued': store.enqueue_exports(p['id'], [r['id'] for r in pending], args.output),
+             'next': 'run: python cli.py work'})
     elif args.command == 'work':
         pool = WorkerPool(store, cache, args.workers, min_free_bytes=args.min_free_mb * 1024 ** 2)
         try:

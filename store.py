@@ -15,7 +15,7 @@ from pathlib import Path
 import core
 from presets import PRESETS, parse_tags
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ACTIVE_JOB_STATES = ('queued', 'running', 'cancel_requested')
 DECISIONS = ('Review', 'Keep', 'Reject')
 
@@ -118,7 +118,13 @@ MIGRATIONS = {
     # Who made a selection decision: a person, or an automatic suggestion they triggered.
     2: ["ALTER TABLE selections ADD COLUMN decided_by TEXT NOT NULL DEFAULT 'human' "
         "CHECK(decided_by IN ('human', 'auto'))"],
+    # Export jobs: one active job per candidate (several per clip), analysis unchanged.
+    3: ['DROP INDEX jobs_active',
+        "CREATE UNIQUE INDEX jobs_active ON jobs(kind, clip_id, "
+        "COALESCE(json_extract(params, '$.candidate_id'), '')) "
+        "WHERE state IN ('queued', 'running', 'cancel_requested')"],
 }
+JOB_TARGET = "COALESCE(json_extract({t}.params, '$.candidate_id'), '')"
 
 
 def now():
@@ -300,7 +306,8 @@ class Store:
             'SELECT c.*, s.label AS source_label, s.status AS source_status, '
             '(SELECT COUNT(*) FROM candidates k WHERE k.clip_id=c.id '
             ' AND k.fingerprint=c.fingerprint) AS candidate_count, '
-            '(SELECT j.state FROM jobs j WHERE j.clip_id=c.id ORDER BY j.id DESC LIMIT 1) '
+            "(SELECT j.state FROM jobs j WHERE j.clip_id=c.id AND j.kind='analyze' "
+            ' ORDER BY j.id DESC LIMIT 1) '
             ' AS job_state '
             'FROM clips c JOIN sources s ON s.id=c.source_id WHERE c.project_id=? '
             + ('' if include_excluded else 'AND c.excluded=0 ') +
@@ -458,6 +465,11 @@ class Store:
                                   'WHERE candidate_id=? AND color_verified=0',
                                   (now(), cid)).rowcount for cid in candidate_ids)
 
+    def verify_all_kept(self, project_id):
+        """Record the reviewer's attestation that display color was checked for every
+        kept frame in the project."""
+        return self.mark_color_verified([r['id'] for r in self.kept(project_id)])
+
     def clip_progress(self, project_id):
         """Per-clip decision counts for the clip's current candidates."""
         rows = self.query(
@@ -535,6 +547,32 @@ class Store:
                 added += cur.rowcount
         return added
 
+    def enqueue_exports(self, project_id, candidate_ids, output):
+        """Queue background exports of kept frames to an existing output parent folder.
+        Returns the number of jobs added (frames already queued are skipped)."""
+        root = Path(output).expanduser().resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError('Output parent must be an existing folder.')
+        stamp, added = now(), 0
+        with self.tx() as db:
+            for cid in candidate_ids:
+                row = db.execute('SELECT k.clip_id FROM candidates k JOIN clips c ON '
+                                 'c.id=k.clip_id WHERE k.id=? AND c.project_id=?',
+                                 (cid, project_id)).fetchone()
+                if row is None:
+                    continue
+                params = json.dumps({'candidate_id': cid, 'output': str(root)})
+                added += db.execute(
+                    "INSERT INTO jobs(project_id, kind, clip_id, params, state, created_at) "
+                    "VALUES(?, 'export', ?, ?, 'queued', ?) ON CONFLICT DO NOTHING",
+                    (project_id, row['clip_id'], params, stamp)).rowcount
+        return added
+
+    def job_counts_by_kind(self, project_id, kind):
+        rows = self.query('SELECT state, COUNT(*) AS n FROM jobs WHERE project_id=? AND kind=? '
+                          'GROUP BY state', (project_id, kind))
+        return {r['state']: r['n'] for r in rows}
+
     def claim_job(self, worker):
         with self.tx() as db:
             row = db.execute("SELECT id FROM jobs WHERE state='queued' ORDER BY id LIMIT 1"
@@ -585,19 +623,22 @@ class Store:
         """Re-queue the latest cancelled/failed job per clip, reusing the same row."""
         resumed = 0
         with self.tx() as db:
+            jt, xt = JOB_TARGET.format(t='j'), JOB_TARGET.format(t='x')
             rows = db.execute(
-                f"SELECT j.id, j.kind, j.clip_id FROM jobs j WHERE j.project_id=? "
-                f"AND j.state IN ({','.join('?' * len(states))}) AND j.id=(SELECT MAX(id) "
-                f"FROM jobs x WHERE x.kind=j.kind AND x.clip_id IS j.clip_id)",
+                f"SELECT j.id, j.kind, j.clip_id, {jt} AS target FROM jobs j "
+                f"WHERE j.project_id=? AND j.state IN ({','.join('?' * len(states))}) "
+                f"AND j.id=(SELECT MAX(id) FROM jobs x WHERE x.kind=j.kind "
+                f"AND x.clip_id IS j.clip_id AND {xt}={jt})",
                 [project_id] + list(states)).fetchall()
             for row in rows:
                 clip = db.execute('SELECT excluded, status FROM clips WHERE id=?',
                                   (row['clip_id'],)).fetchone()
-                if clip is None or clip['excluded'] or clip['status'] != 'present':
+                if clip is None or clip['status'] != 'present' or (
+                        clip['excluded'] and row['kind'] == 'analyze'):
                     continue
-                if db.execute('SELECT 1 FROM jobs WHERE kind=? AND clip_id=? AND state IN '
-                              "('queued','running','cancel_requested')",
-                              (row['kind'], row['clip_id'])).fetchone():
+                if db.execute(f"SELECT 1 FROM jobs x WHERE kind=? AND clip_id=? AND {xt}=? "
+                              "AND state IN ('queued','running','cancel_requested')",
+                              (row['kind'], row['clip_id'], row['target'])).fetchone():
                     continue
                 db.execute("UPDATE jobs SET state='queued', attempts=0, error=NULL, "
                            "progress=0, finished_at=NULL WHERE id=?", (row['id'],))
