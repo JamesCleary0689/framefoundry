@@ -63,3 +63,22 @@ class AppSmokeTest(unittest.TestCase):
         label = f"{first['source_label']} / {first['rel_path']}"
         self.assertNotIn(label, clip_picker.options)
         self.assertEqual(len(clip_picker.options), 2)
+
+    def test_browse_fills_source_path_and_adds_source(self):
+        import picker
+        chosen = Path(self._temp.name) / 'Picked Card'
+        chosen.mkdir()
+        with mock.patch.object(picker, 'available', return_value=True), \
+                mock.patch.object(picker, 'pick_folder', return_value=str(chosen)) as pick:
+            at = AppTest.from_file(APP, default_timeout=60).run()
+            at.button(key='source-path-browse').click().run()
+            self.assertFalse(at.exception, at.exception)
+            self.assertEqual(pick.call_args.args[0],
+                             'Choose a folder of video clips (e.g. one camera or card)')
+            self.assertEqual(at.text_input(key='source-path').value, str(chosen))
+            at.text_input(key='source-label').input('Camera C')
+            [b for b in at.button if b.label == 'Add source'][0].click().run()
+            self.assertFalse(at.exception, at.exception)
+        labels = [s['label'] for s in self.store.sources(self.pid)]
+        self.assertIn('Camera C', labels)
+        self.assertEqual(at.text_input(key='source-path').value, '')

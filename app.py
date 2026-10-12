@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import streamlit as st
 
+import picker
 from cli import home
 from core import dependencies
 from presets import PRESETS, parse_tags
@@ -35,6 +36,31 @@ def services(base):
 
 store, pool = services(str(home()))
 NEW = 0
+
+
+def browse(key, prompt):
+    """Open the computer's native folder window and put the choice into a text field."""
+    try:
+        chosen = picker.pick_folder(prompt, st.session_state.get(key) or None)
+    except Exception as e:
+        st.session_state[f'{key}-error'] = str(e)
+        return
+    if chosen:
+        st.session_state[key] = chosen
+
+
+def folder_field(label, key, prompt, placeholder=''):
+    """Path text field with a Browse… button that opens a native folder window."""
+    left, right = st.columns([5, 1], vertical_alignment='bottom')
+    value = left.text_input(label, key=key, placeholder=placeholder)
+    right.button('Browse…', key=f'{key}-browse', on_click=browse, args=(key, prompt),
+                 disabled=not picker.available(), width='stretch',
+                 help='Choose a folder on this computer' if picker.available() else
+                      'No folder window is available on this system; type the path.')
+    error = st.session_state.pop(f'{key}-error', None)
+    if error:
+        st.error(error)
+    return value
 
 # -- project ----------------------------------------------------------------
 with st.sidebar:
@@ -81,17 +107,25 @@ sources_tab, clips_tab, queue_tab, sheet_tab, export_tab = st.tabs(
 
 # -- sources ------------------------------------------------------------------
 with sources_tab:
-    with st.form('add-source', clear_on_submit=True):
-        left, right = st.columns([3, 1])
-        path = left.text_input('Source folder on this computer',
-                               placeholder='/Volumes/CardA/Footage')
-        label = right.text_input('Label', placeholder='Camera A')
-        if st.form_submit_button('Add source'):
-            try:
-                store.add_source(pid, path, label or None)
-                st.success('Added. Scan to inventory it.')
-            except Exception as e:
-                st.error(str(e))
+    def add_source():
+        try:
+            store.add_source(pid, st.session_state.get('source-path', '').strip(),
+                             st.session_state.get('source-label', '').strip() or None)
+            st.session_state['source-path'] = st.session_state['source-label'] = ''
+            st.session_state['source-message'] = ('success', 'Added. Scan to inventory it.')
+        except Exception as e:
+            st.session_state['source-message'] = ('error', str(e))
+
+    folder_field('Source folder on this computer', 'source-path',
+                 'Choose a folder of video clips (e.g. one camera or card)',
+                 '/Volumes/CardA/Footage')
+    left, right = st.columns([5, 1], vertical_alignment='bottom')
+    left.text_input('Label (optional)', key='source-label', placeholder='Camera A')
+    right.button('Add source', on_click=add_source, width='stretch',
+                 disabled=not st.session_state.get('source-path', '').strip())
+    kind, message = st.session_state.pop('source-message', (None, None))
+    if kind:
+        getattr(st, kind)(message)
     sources = store.sources(pid)
     if sources:
         if st.button('Scan all sources', type='primary'):
@@ -254,8 +288,9 @@ with sheet_tab:
 # -- selections and export ------------------------------------------------------
 with export_tab:
     kept = store.kept(pid)
-    output = st.text_input('Existing export parent folder', key=f'output-{pid}',
-                           placeholder='/Volumes/BackupDrive/Project')
+    output = folder_field('Existing export parent folder', f'output-{pid}',
+                          'Choose the folder to export stills into',
+                          '/Volumes/BackupDrive/Project')
     st.caption(f"Exports go to `<parent>/{project['export_prefix']}_Still_Selects/` as "
                'full-resolution PNG + provenance JSON + CSV index. Existing files are never '
                'overwritten. FFmpeg default decode; no creative grade or color transform.')

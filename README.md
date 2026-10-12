@@ -30,7 +30,9 @@ JSON-based foundation (`reviews.json`) are not migrated into the database.
 
 ## Run locally on your Mac
 
-Requires Python 3.11+ and FFmpeg/FFprobe on PATH. If Homebrew is already installed,
+Requires Python 3.11–3.14 and FFmpeg/FFprobe on PATH. Python 3.15 is not yet
+supported on macOS: current Streamlit requires a pyarrow release that has no 3.15
+wheels, so pip tries (and fails) to build it from source. Python 3.13 is recommended. If Homebrew is already installed,
 `brew install ffmpeg` installs the media tools.
 
 ```bash
@@ -41,7 +43,8 @@ python -m streamlit run app.py --server.address 127.0.0.1
 ```
 
 Create a project (name, export prefix, starting subject tags), add one source folder
-per camera or card, scan, then queue analysis from the Queue tab. Review candidates
+per camera or card (type the path or click **Browse…** to choose it in the
+native macOS folder window), scan, then queue analysis from the Queue tab. Review candidates
 on the contact sheet, exclude irrelevant clips in the Clips tab, and export kept
 frames from Selections & export. The output parent must already exist to avoid
 silently writing to a missing external-drive mount.
