@@ -1,4 +1,5 @@
 """FrameFoundry — local review workbench. Run: streamlit run app.py --server.address 127.0.0.1"""
+import hashlib
 import os
 
 import pandas as pd
@@ -231,8 +232,21 @@ with clips_tab:
     if not clips:
         st.info('No clips yet. Add and scan a source.')
     else:
-        st.write(f"{len(clips)} clips · {sum(c['excluded'] for c in clips)} excluded · "
+        analyzed_ids = {c['id'] for c in clips if c['candidate_count'] and not c['excluded']}
+        st.write(f"{len(clips)} clips · {len(analyzed_ids)} analyzed · "
+                 f"{sum(c['excluded'] for c in clips)} excluded · "
                  f"{sum(c['status'] == 'missing' for c in clips)} missing · originals untouched")
+        show_done = st.toggle('Show already-analyzed clips', key=f'show-analyzed-{pid}',
+                              help='Analyzed clips are reviewed on the contact sheet. Show them '
+                                   'here to exclude one from review or change its color profile.')
+        if not show_done:
+            clips = [c for c in clips if c['id'] not in analyzed_ids]
+            if analyzed_ids:
+                st.caption(f'{len(analyzed_ids)} analyzed clip(s) hidden; they are on the '
+                           'contact sheet.')
+            if not clips:
+                st.success('Every clip has been analyzed. Review them on the contact sheet.')
+    if clips:
         rows = [{'id': c['id'], 'exclude': c['excluded'], 'reason': c['exclusion_reason'],
                  'source': c['source_label'], 'clip': c['rel_path'],
                  'MB': round(c['size'] / 1e6, 1),
@@ -249,7 +263,10 @@ with clips_tab:
         # A stable key keeps the table mounted (and scrolled) while edits are saved; the
         # version only changes when clip settings change elsewhere (e.g. contact sheet).
         version = st.session_state.setdefault('clip-editor-version', 0)
-        key = f'clips-{pid}-{version}'
+        # Edits are remembered by row position, so the key must change whenever the set
+        # or order of rows changes (analysis finishing, rescans, the toggle above).
+        rows_id = hashlib.sha1('|'.join(r['id'] for r in rows).encode()).hexdigest()[:10]
+        key = f'clips-{pid}-{version}-{rows_id}'
         st.data_editor(
             pd.DataFrame(rows), hide_index=True, key=key,
             column_order=[k for k in rows[0] if k != 'id'],

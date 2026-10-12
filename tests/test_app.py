@@ -165,3 +165,14 @@ class AppSmokeTest(unittest.TestCase):
         export_all().click().run()
         self.assertTrue(any('Queued' in s.value for s in at.success))
         self.assertTrue(all(r['color_verified'] for r in self.store.kept(self.pid)))
+
+    def test_clips_tab_hides_analyzed_clips_by_default(self):
+        at = AppTest.from_file(APP, default_timeout=60).run()
+        self.assertFalse(at.exception, at.exception)
+        captions = ' '.join(c.value for c in at.caption)
+        self.assertIn('3 analyzed clip(s) hidden', captions)  # the corrupt clip stays listed
+        editor = [d for d in at.dataframe if 'clip' in d.value.columns][0]
+        self.assertEqual(list(editor.value['clip']), ['DCIM/C0002.mp4'])
+        at.toggle(key=f'show-analyzed-{self.pid}').set_value(True).run()
+        editor = [d for d in at.dataframe if 'clip' in d.value.columns][0]
+        self.assertEqual(len(editor.value), 4)
