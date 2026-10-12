@@ -104,8 +104,10 @@ with st.sidebar:
     st.caption('Uniform sparse sampling can miss brief moments. Scene-aware sampling '
                'and exact frame navigation are planned.')
 
-def apply_profile(kind, obj_id, profile):
+def apply_profile(kind, obj_id, profile, from_table=False):
     """Set a source/clip color profile, then queue re-analysis of affected clips."""
+    if not from_table:  # refresh the clips table so it does not show a stale override
+        st.session_state['clip-editor-version'] = st.session_state.get('clip-editor-version', 0) + 1
     try:
         (store.set_source_profile if kind == 'source' else store.set_clip_profile)(obj_id, profile)
         n = store.enqueue_analysis(pid)
@@ -113,6 +115,19 @@ def apply_profile(kind, obj_id, profile):
                                                f'{color.label(profile)}; re-analyzing {n} clip(s).')
     except Exception as e:
         st.session_state['profile-message'] = ('error', str(e))
+
+
+def save_clip_edits(key, rows):
+    """Apply edits from the clips table in place (no remount, so it keeps its scroll).
+    Edits accumulate in the widget state; already-applied ones are no-ops."""
+    for index, change in st.session_state[key]['edited_rows'].items():
+        before = rows[int(index)]
+        if change.get('override') and change['override'] != before['override']:
+            apply_profile('clip', before['id'], change['override'], from_table=True)
+        exclude = bool(change.get('exclude', before['exclude']))
+        reason = change.get('reason', before['reason']) or ''
+        if (exclude, reason) != (before['exclude'], before['reason']):
+            store.set_excluded(before['id'], exclude, reason)
 
 
 def on_profile_select(kind, obj_id, key):
@@ -231,11 +246,15 @@ with clips_tab:
                  'size': f"{c['probe']['width']}×{c['probe']['height']}" if c['probe'] else None,
                  'seconds': round(c['probe']['duration'], 2) if c['probe'] else None,
                  'error': c['error']} for c in clips]
+        # A stable key keeps the table mounted (and scrolled) while edits are saved; the
+        # version only changes when clip settings change elsewhere (e.g. contact sheet).
         version = st.session_state.setdefault('clip-editor-version', 0)
-        edited = st.data_editor(
-            pd.DataFrame(rows), hide_index=True, key=f'clips-{pid}-{version}',
+        key = f'clips-{pid}-{version}'
+        st.data_editor(
+            pd.DataFrame(rows), hide_index=True, key=key,
             column_order=[k for k in rows[0] if k != 'id'],
             disabled=[k for k in rows[0] if k not in ('exclude', 'reason', 'override')],
+            on_change=save_clip_edits, args=(key, rows),
             column_config={
                 'override': st.column_config.SelectboxColumn(
                     'Color override', options=[c for c in color.CHOICES if c != 'lut'],
@@ -244,17 +263,6 @@ with clips_tab:
                 'exclude': st.column_config.CheckboxColumn(
                 'Exclude', help='Reversible. Excluded clips are skipped by analysis and '
                                 'hidden from the contact sheet; footage is never deleted.')})
-        changed = 0
-        for before, after in zip(rows, edited.to_dict('records')):
-            if after['override'] and after['override'] != before['override']:
-                apply_profile('clip', before['id'], after['override'])
-                changed += 1
-            if (before['exclude'], before['reason']) != (bool(after['exclude']),
-                                                         after['reason'] or ''):
-                changed += store.set_excluded(before['id'], after['exclude'], after['reason'])
-        if changed:
-            st.session_state['clip-editor-version'] = version + 1
-            st.rerun()
         st.caption('Codec, size and duration appear after analysis. Errors are per clip '
                    'and never stop the rest of the batch.')
 
